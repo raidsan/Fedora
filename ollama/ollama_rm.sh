@@ -13,51 +13,55 @@ install_logic() {
 # --- 2. Business Logic ---
 
 if [ $# -eq 0 ]; then
-    echo "Usage: ollama_rm <name_or_url> [name2...]"
+    echo "Usage: ollama_rm <model_name_or_url> [name2...]"
     exit 1
 fi
 
-# Get current model list data
-MODELS_DATA=$(ollama list | tail -n +2 | awk '{print $1, $2}')
+# Step 1: Pre-process and parse the local model list
+# We create a temporary structured list: [Full_Name] [ID] [Extracted_Short_Name]
+raw_list=$(ollama list | tail -n +2 | awk '{print $1, $2}')
+parsed_db=$(echo "$raw_list" | while read -r FULL_NAME ID; do
+    # Extract short name: if it's a URL, take the last part; otherwise, use it as is
+    if [[ "$FULL_NAME" == *"/"* ]]; then
+        SHORT_NAME=$(echo "$FULL_NAME" | awk -F'/' '{print $NF}')
+    else
+        SHORT_NAME="$FULL_NAME"
+    fi
+    echo "$FULL_NAME $ID $SHORT_NAME"
+done)
 
 for INPUT in "$@"; do
-    echo "🔍 Searching for: $INPUT"
+    echo "🔍 Processing input: $INPUT"
     
-    # 1. Try exact match first
-    TARGET_ID=$(echo "$MODELS_DATA" | awk -v t="$INPUT" '$1 == t {print $2}')
-
-    # 2. If not found, try to match the short name within URL strings
-    if [ -z "$TARGET_ID" ]; then
-        # Look for a URL that ends with the input (e.g., .../library/qwen2.5-coder:32b)
-        # We use a regex that matches either exactly or after a slash
-        TARGET_ID=$(echo "$MODELS_DATA" | awk -v t="$INPUT" '$1 ~ "/"t"$" {print $2; exit}')
-    fi
+    # Step 2: Try to find the Digest ID by matching either Full_Name or Short_Name
+    # $1 is Full_Name, $3 is Extracted_Short_Name
+    TARGET_ID=$(echo "$parsed_db" | awk -v in="$INPUT" '$1 == in || $3 == in {print $2; exit}')
 
     if [ -z "$TARGET_ID" ]; then
-        echo "❌ Error: Could not find any model matching '$INPUT'."
+        echo "❌ Error: No local model matches '$INPUT' (checked both Full Name and Short Name)."
         continue
     fi
 
-    echo "🆔 Linked to Digest ID: $TARGET_ID"
+    echo "🆔 Found matching Digest ID: $TARGET_ID"
 
-    # 3. Find ALL tags (aliases and URLs) sharing this same ID
-    NAMES_TO_DELETE=$(echo "$MODELS_DATA" | awk -v id="$TARGET_ID" '$2 == id {print $1}')
+    # Step 3: Identify ALL instances (tags) tied to this ID for deletion
+    NAMES_TO_DELETE=$(echo "$raw_list" | awk -v id="$TARGET_ID" '$2 == id {print $1}')
 
-    echo "🗑️  The following instances will be purged:"
+    echo "🗑️  Purging all associated tags:"
     echo "$NAMES_TO_DELETE"
     echo "-------------------------------------------"
 
-    # 4. Batch delete
+    # Step 4: Execution
     for NAME in $NAMES_TO_DELETE; do
         ollama rm "$NAME"
     done
 
-    echo "✅ Successfully removed all instances of ID ${TARGET_ID:0:12}"
+    echo "✅ Successfully wiped ID ${TARGET_ID:0:12}"
 done
 INNER_EOF
 
     chmod +x "$TARGET_PATH"
-    echo "✅ Smart tool installed to $TARGET_PATH"
+    echo "✅ Rigorous cleanup tool installed to $TARGET_PATH"
 }
 
 install_logic
