@@ -10,6 +10,7 @@ install_logic() {
     
     cat << 'INNER_EOF' > "$TARGET_PATH"
 #!/bin/bash
+# 设置基础环境路径
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # --- 变量初始化 ---
@@ -17,8 +18,7 @@ MODELS=()
 MIRROR_NAME="dao" 
 MIRROR_PREFIX="ollama.m.daocloud.io/library/" 
 
-# --- 改进后的参数解析 ---
-# 遍历所有参数，识别镜像设置
+# --- 参数解析 ---
 for arg in "$@"; do
     case $arg in
         --p=nju|-p=nju)
@@ -34,7 +34,6 @@ for arg in "$@"; do
             exit 1
             ;;
         *)
-            # 只有不带 -p 的才被视为模型名
             MODELS+=("$arg")
             ;;
     esac
@@ -47,11 +46,11 @@ fi
 
 trap 'echo -e "\n🛑 User interrupted. Exiting..."; exit 1' SIGINT SIGTERM
 
-# --- 批量下载循环 ---
+# --- 批量处理 ---
 for INPUT in "${MODELS[@]}"; do
     echo "----------------------------------------------------"
     
-    # 路径校验逻辑
+    # 路径与镜像一致性校验
     if [[ "$INPUT" == *"/"* ]]; then
         if [[ "$INPUT" != "$MIRROR_PREFIX"* ]]; then
             echo "Conflict Error!"
@@ -66,9 +65,38 @@ for INPUT in "${MODELS[@]}"; do
         SHORT_NAME="$INPUT"
     fi
 
+    echo "🔍 Validating: $FULL_URL"
+
+    # --- 网站存在性检查逻辑 ---
+    # 解析 URL 得到域名、镜像名和标签
+    # 转换为典型的 Docker V2 Registry API 路径进行检查
+    DOMAIN=$(echo "$FULL_URL" | cut -d'/' -f1)
+    # 处理带 library 或不带的情况
+    REPOS=$(echo "$FULL_URL" | cut -d'/' -f2-)
+    # 替换冒号为标签路径 (manifests/tag)
+    IMG_NAME=$(echo "${REPOS%:*}")
+    IMG_TAG=$(echo "${REPOS#*:}")
+    
+    # 使用 curl 检查 Manifests 是否存在 (返回 200 即存在)
+    CHECK_URL="https://${DOMAIN}/v2/${IMG_NAME}/manifests/${IMG_TAG}"
+    
+    # 发起 HEAD 请求验证
+    HTTP_CODE=$(curl -I -s -o /dev/null -w "%{http_code}" "$CHECK_URL")
+
+    if [ "$HTTP_CODE" -ne 200 ]; then
+        echo "❌ Error: Model NOT found on registry!"
+        echo "Status Code: $HTTP_CODE"
+        echo "Checked URL: $CHECK_URL"
+        echo "Please verify the model name or tag."
+        # 验证失败，跳过该模型或报错停止
+        exit 1
+    fi
+
+    echo "✅ Validation passed. Starting download..."
     echo "🚀 Model  : $SHORT_NAME"
     echo "🌐 Source : $FULL_URL"
     
+    # 进入断点续传重试循环
     while true; do
         echo "🔄 Pulling data (Resume supported)..."
         if ollama pull "$FULL_URL"; then
@@ -91,9 +119,10 @@ echo "🎉 All tasks completed!"
 INNER_EOF
 
     chmod +x "$TARGET_PATH"
-    echo "✅ Ollama Pull Tool updated and fixed at $TARGET_PATH"
+    echo "✅ Ollama Pull Tool updated with Pre-flight Validation at $TARGET_PATH"
 }
 
+# --- 环境变量处理与立即执行 ---
 install_logic
 if [ $# -gt 0 ]; then
     "$TARGET_PATH" "$@"
