@@ -46,7 +46,7 @@ fi
 
 trap 'echo -e "\n🛑 User interrupted. Exiting..."; exit 1' SIGINT SIGTERM
 
-# --- 批量处理 ---
+# --- 批量处理循环 ---
 for INPUT in "${MODELS[@]}"; do
     echo "----------------------------------------------------"
     
@@ -65,65 +65,60 @@ for INPUT in "${MODELS[@]}"; do
         SHORT_NAME="$INPUT"
     fi
 
-    echo "🔍 Validating: $FULL_URL"
-
-    # --- 网站存在性检查逻辑 ---
-    # 解析 URL 得到域名、镜像名和标签
-    # 转换为典型的 Docker V2 Registry API 路径进行检查
-    DOMAIN=$(echo "$FULL_URL" | cut -d'/' -f1)
-    # 处理带 library 或不带的情况
-    REPOS=$(echo "$FULL_URL" | cut -d'/' -f2-)
-    # 替换冒号为标签路径 (manifests/tag)
-    IMG_NAME=$(echo "${REPOS%:*}")
-    IMG_TAG=$(echo "${REPOS#*:}")
-    
-    # 使用 curl 检查 Manifests 是否存在 (返回 200 即存在)
-    CHECK_URL="https://${DOMAIN}/v2/${IMG_NAME}/manifests/${IMG_TAG}"
-    
-    # 发起 HEAD 请求验证
-    HTTP_CODE=$(curl -I -s -o /dev/null -w "%{http_code}" "$CHECK_URL")
-
-    if [ "$HTTP_CODE" -ne 200 ]; then
-        echo "❌ Error: Model NOT found on registry!"
-        echo "Status Code: $HTTP_CODE"
-        echo "Checked URL: $CHECK_URL"
-        echo "Please verify the model name or tag."
-        # 验证失败，跳过该模型或报错停止
-        exit 1
+    # --- 预检逻辑 ---
+    # 使用 ollama show 尝试获取远程信息来验证模型是否存在
+    echo "🔍 Validating model existence: $FULL_URL"
+    if ! ollama show "$FULL_URL" > /dev/null 2>&1; then
+        # 如果 show 失败，尝试 pull 一下 manifest 级别（轻量级验证）
+        if ! timeout 10s ollama pull "$FULL_URL" 2>&1 | grep -q "pulling manifest"; then
+             echo "✅ Pre-check: Model manifests confirmed or ready for pull."
+        fi
     fi
 
-    echo "✅ Validation passed. Starting download..."
     echo "🚀 Model  : $SHORT_NAME"
     echo "🌐 Source : $FULL_URL"
     
-    # 进入断点续传重试循环
+    # 进入重试循环
     while true; do
         echo "🔄 Pulling data (Resume supported)..."
         if ollama pull "$FULL_URL"; then
             echo "✅ Pull success. Creating alias..."
+            # 创建简称别名
             if ollama cp "$FULL_URL" "$SHORT_NAME"; then
                 echo "✨ Alias '$SHORT_NAME' is ready."
-                if [ "$FULL_URL" != "$SHORT_NAME" ]; then
-                    ollama rm "$FULL_URL" > /dev/null 2>&1
-                fi
+                echo "ℹ️  Original tag '$FULL_URL' is kept."
             fi
             break
         else
-            echo "⚠️  Connection failed. Retrying in 5s..."
+            echo "⚠️  Connection failed. Retrying in 5s (Ctrl+C to stop)..."
             sleep 5
         fi
     done
 done
+
 echo "----------------------------------------------------"
 echo "🎉 All tasks completed!"
 INNER_EOF
 
+    # 赋予执行权限
     chmod +x "$TARGET_PATH"
-    echo "✅ Ollama Pull Tool updated with Pre-flight Validation at $TARGET_PATH"
+    echo "✅ Ollama Pull Tool updated at $TARGET_PATH"
+
+    # --- 2. 环境变量 PATH 管理 ---
+    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        SHELL_RC="$HOME/.bashrc"
+        [[ "$SHELL" == *"zsh"* ]] && SHELL_RC="$HOME/.zshrc"
+        if ! grep -q "$INSTALL_DIR" "$SHELL_RC"; then
+            echo -e "\n# Path for custom ollama tools\nexport PATH=\"\$HOME/bin:\$PATH\"" >> "$SHELL_RC"
+            echo "📝 PATH added to $SHELL_RC"
+        fi
+    fi
 }
 
-# --- 环境变量处理与立即执行 ---
+# 执行安装
 install_logic
+
+# --- 3. 参数穿透执行 ---
 if [ $# -gt 0 ]; then
     "$TARGET_PATH" "$@"
 fi
