@@ -4,6 +4,8 @@ Fedora install &amp; tools
 ## for ollama  
 curl -sL https://raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_pull.sh | bash  
 curl -sL https://raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_list.sh | bash  
+curl -sL https://raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_rm.sh | bash  
 or  
 curl -sL https://gh-proxy.com/raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_pull.sh | bash  
 curl -sL https://gh-proxy.com/raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_list.sh | bash  
+curl -sL https://gh-proxy.com/raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/ollama/ollama_rm.sh | bash  
