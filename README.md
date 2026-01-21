@@ -6,8 +6,8 @@ or
 export GITHUB=https://gh-proxy.com/raw.githubusercontent.com  
 
 export MAIN=$GITHUB/raidsan/Fedora/refs/heads/main  
-
-curl -sL $MAIN/github-tools.sh | sudo bash  
+export TOOLS_URL=$MAIN/github-tools.sh  
+curl -sL $TOOLS_URL | sudo bash -s -- $TOOLS_URL  
 
 ## for ollama  
 github-tools $MAIN /ollama-tools/ollama_pull.sh | bash  
