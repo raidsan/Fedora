@@ -64,16 +64,31 @@ do_install() {
 if [[ "$0" == *"bash"* ]] || [[ "$0" == *"sh"* ]]; then
     if [ "$EUID" -ne 0 ]; then echo "请使用 sudo 运行"; exit 1; fi
     
-    # 1. 将自身写入执行路径
-    cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
+    # 改进点：判断 $0 是否为有效文件，如果不是，则从 stdin 读取
+    if [ -f "$0" ]; then
+        cat "$0" > "$DEST_PATH"
+    else
+        # 此时脚本内容在内存中，由于是在 sudo bash 环境，
+        # 我们利用一个临时变量或重定向来保存内容
+        # 在管道执行时，最稳妥的方法是再次使用追溯到的 URL 进行下载自存
+        URL=$(get_download_url)
+        if [ -n "$URL" ]; then
+            curl -sL "$URL" -o "$DEST_PATH"
+        else
+            # 如果实在没法追溯 URL，提示用户手动保存
+            echo "错误: 管道模式下无法读取自身文件且未检测到 URL。请手动安装。"
+            exit 1
+        fi
+    fi
     
-    # 2. 尝试获取下载 URL 并保存元数据
-    URL=$(get_download_url)
+    chmod +x "$DEST_PATH"
+    
+    # 记录元数据
     if [ -n "$URL" ]; then
         save_metadata "$TOOL_NAME" "$URL"
         echo "检测到下载来源并已注册: $URL"
     fi
-    echo "$TOOL_NAME 已安装到 $DEST_PATH"
+    echo "github-tools 已安装到 $DEST_PATH"
     exit 0
 fi
 
