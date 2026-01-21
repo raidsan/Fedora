@@ -10,7 +10,7 @@
 
 DEST_PATH="/usr/local/bin/ollama_blobs"
 
-# --- 第一阶段: 安装逻辑 (供 github-tools 使用) ---
+# --- 第一阶段: 安装逻辑 ---
 if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
     if [ "$EUID" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
     cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
@@ -26,6 +26,7 @@ for arg in "$@"; do
     if [ "$arg" == "--blob-path" ]; then
         ONLY_PATH=true
     else
+        # 允许传入关键字，且不区分大小写进行匹配
         KEYWORD="$arg"
     fi
 done
@@ -33,8 +34,19 @@ done
 # --- 第三阶段: 核心逻辑 ---
 
 get_models_dir() {
+    # 尝试从进程获取 (需要 sudo)
     local env_path=$(strings /proc/$(pgrep -x ollama | head -n 1)/environ 2>/dev/null | grep OLLAMA_MODELS | cut -d= -f2)
-    if [ -d "$env_path" ]; then echo "$env_path"; return; fi
+    
+    if [ -d "$env_path" ]; then
+        echo "$env_path"
+        return
+    fi
+
+    # 如果没找到且不是 root，提示用户
+    if [ "$EUID" -ne 0 ] && [ "$ONLY_PATH" = false ]; then
+        echo "提示: 非 root 运行，无法读取 Ollama 进程环境。尝试默认路径..." >&2
+    fi
+
     if [ -d "/usr/share/ollama/.ollama/models" ]; then
         echo "/usr/share/ollama/.ollama/models"
     elif [ -d "/var/lib/ollama/.ollama/models" ]; then
@@ -50,61 +62,52 @@ MANIFEST_ROOT="$MODELS_ROOT/manifests"
 BLOBS_DIR="$MODELS_ROOT/blobs"
 
 if [ ! -d "$MANIFEST_ROOT" ]; then
-    [ "$ONLY_PATH" = false ] && echo "错误: 无法定位 Manifests 目录。"
+    [ "$ONLY_PATH" = false ] && echo "错误: 无法定位 Manifests 目录 [$MANIFEST_ROOT]"
     exit 1
 fi
 
-# 收集匹配的结果
+# 核心搜索与过滤
 results=$( {
+    # 这里的 -ipath 是为了兼容某些深层路径
     find "$MANIFEST_ROOT" -type f 2>/dev/null | while read -r file; do
-        # 1. 切除域名路径
-        rel_path=$(echo "$file" | sed -n 's|.*/manifests/[^/]\+/||p')
-        [ -z "$rel_path" ] && continue
+        # 1. 获取相对路径并规范化标签
+        # 去掉 manifests/ 及其后的域名层
+        rel_name=$(echo "$file" | sed "s|^$MANIFEST_ROOT/||" | sed 's|[^/]*/||')
         
-        # 2. 格式化并去掉 library/
-        model_tag=$(echo "$rel_path" | sed 's/\/\([^/]*\)$/:\1/')
+        # 将最后的斜杠换成冒号 (如 library/qwen/latest -> library/qwen:latest)
+        model_tag=$(echo "$rel_name" | sed 's/\/\([^/]*\)$/:\1/')
+        
+        # 统一去掉 library/ 前缀
         model_tag=${model_tag#library/}
         
-        # 3. 关键字过滤 (如果提供了关键字)
+        # 2. 严格关键字过滤 (不区分大小写)
         if [ -n "$KEYWORD" ]; then
-            if [[ ! "$model_tag" =~ "$KEYWORD" ]]; then
+            if [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
                 continue
             fi
         fi
 
-        # 4. 提取 Model 类型的 Blob
+        # 3. 提取对应的权重 Blob
         raw_blob=$(grep -B 2 'image.model' "$file" | grep -oP '"digest":"\K[^"]+' | head -n 1 | sed 's/:/-/g')
-        if [ -z "$raw_blob" ]; then
-            raw_blob=$(grep -oP '"digest":"\K[^"]+' "$file" | head -n 1 | sed 's/:/-/g')
-        fi
+        [ -z "$raw_blob" ] && raw_blob=$(grep -oP '"digest":"\K[^"]+' "$file" | head -n 1 | sed 's/:/-/g')
         
         if [ -n "$raw_blob" ]; then
             if [ "$ONLY_PATH" = true ]; then
-                # 仅输出路径模式：输出绝对路径
                 echo "$BLOBS_DIR/$raw_blob"
             else
-                # 普通表格模式
                 printf "%-50s %-75s\n" "$model_tag" "$raw_blob"
             fi
         fi
     done
 } | sort -u )
 
-# --- 第四阶段: 输出控制 ---
+# --- 第四阶段: 输出 ---
 if [ "$ONLY_PATH" = true ]; then
-    # 直接输出路径列表，不带表头
-    if [ -n "$results" ]; then
-        echo "$results"
-    fi
+    [ -n "$results" ] && echo "$results"
 else
-    # 输出完整表格
     echo "Ollama 模型根目录: $MODELS_ROOT"
     echo ""
     printf "%-50s %-75s\n" "MODEL TAG (Short)" "DATA BLOB HASH"
     printf "%-50s %-75s\n" "--------------------------------------------------" "---------------------------------------------------------------------------"
-    if [ -n "$results" ]; then
-        echo "$results"
-    else
-        echo "(无匹配模型)"
-    fi
+    [ -n "$results" ] && echo "$results" || echo "(无匹配结果)"
 fi
