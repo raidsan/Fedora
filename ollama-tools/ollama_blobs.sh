@@ -1,38 +1,47 @@
 #!/bin/bash
 
 # ==============================================================================
-# 功能描述: 列出 Ollama 已安装模型的简称及其对应的完整 Blob 哈希值。
-#          哈希值采用原始格式显示 (例如: sha256-xxxx...)。
-#          模型名称处理：去掉所有 Manifest 根路径，保留模型完整标识。
-#
-# 用法:
-#   1. 安装: curl -sL <GitHub_URL>/ollama_blobs.sh | sudo bash
-#   2. 运行: sudo ollama_blobs
+# 功能: 列出所有 Ollama 模型简称及其对应的原始 Blob 哈希 (sha256-xxx)
+# 兼容: 支持自定义 OLLAMA_MODELS 路径及各种镜像站域名路径清理
+# 管理: 建议通过 github-tools 安装及更新
 # ==============================================================================
 
-# --- 安装逻辑 ---
-if [[ "$0" == *"bash"* ]] || [[ "$0" == *"sh"* ]]; then
+# --- 第一阶段: 安装逻辑 (当通过 curl | bash 运行或不在目标路径时触发) ---
+DEST_PATH="/usr/local/bin/ollama_blobs"
+
+if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
     if [ "$EUID" -ne 0 ]; then
-        echo "错误: 请使用 sudo 执行安装。"
+        echo "错误: 请使用 sudo 权限运行安装。"
         exit 1
     fi
+    
+    # 将自身脚本内容写入目标路径
+    cat "$0" > "$DEST_PATH"
+    chmod +x "$DEST_PATH"
+    
+    echo "ollama_blobs 已成功安装到 $DEST_PATH"
+    # 如果是由 github-tools 调用的，安装后会自动记录元数据
+    exit 0
+fi
 
-    DEST_PATH="/usr/local/bin/ollama_blobs"
-    echo "--- 正在安装/更新 ollama_blobs 到 $DEST_PATH ---"
+# --- 第二阶段: 核心功能逻辑 (作为 /usr/local/bin/ollama_blobs 运行时) ---
 
-    cat << 'EOF' > "$DEST_PATH"
-#!/bin/bash
-
-# 自动探测模型存储路径
+# 1. 动态探测 Ollama 模型存储根目录
 get_models_dir() {
+    # 优先从运行中的 ollama 进程抓取环境变量
     local env_path=$(strings /proc/$(pgrep -x ollama | head -n 1)/environ 2>/dev/null | grep OLLAMA_MODELS | cut -d= -f2)
-    if [ -d "$env_path" ]; then echo "$env_path"; return; fi
+    if [ -d "$env_path" ]; then
+        echo "$env_path"
+        return
+    fi
 
+    # 其次检查 Linux 系统服务默认路径
     if [ -d "/usr/share/ollama/.ollama/models" ]; then
         echo "/usr/share/ollama/.ollama/models"
     elif [ -d "/var/lib/ollama/.ollama/models" ]; then
         echo "/var/lib/ollama/.ollama/models"
     else
+        # 最后检查当前用户的家目录
         local target_user=${SUDO_USER:-$USER}
         local user_home=$(getent passwd "$target_user" | cut -d: -f6)
         echo "$user_home/.ollama/models"
@@ -40,39 +49,39 @@ get_models_dir() {
 }
 
 MODELS_ROOT=$(get_models_dir)
-# 获取 registry 根目录 (如 .../registry.ollama.ai)
-REGISTRY_ROOT=$(find "$MODELS_ROOT/manifests" -maxdepth 1 -type d -name "*registry*" | head -n 1)
+MANIFEST_ROOT="$MODELS_ROOT/manifests"
 
-if [ ! -d "$REGISTRY_ROOT" ]; then
-    echo "错误: 无法定位 Manifest 注册表目录。"
+if [ ! -d "$MANIFEST_ROOT" ]; then
+    echo "错误: 找不到 Ollama 模型目录 (探测路径: $MODELS_ROOT)"
+    echo "请确认 Ollama 已安装且至少下载了一个模型。"
     exit 1
 fi
 
-# 打印表头
+# 2. 打印表头 (简称列 50 字符)
 printf "%-50s %-75s\n" "MODEL TAG (Short)" "RAW BLOB HASH"
 printf "%-50s %-75s\n" "--------------------------------------------------" "---------------------------------------------------------------------------"
 
-# 遍历所有 Manifest 文件
-find "$REGISTRY_ROOT" -type f | while read -r file; do
-    # 1. 提取相对于注册表根目录的路径
-    # 例如: /.../registry.ollama.ai/library/deepseek/latest -> library/deepseek/latest
-    rel_path=${file#$REGISTRY_ROOT/}
+# 3. 扫描并格式化输出
+# 逻辑：在 manifests 目录下寻找所有文件，通过 sed 彻底切除域名路径
+find "$MANIFEST_ROOT" -type f 2>/dev/null | while read -r file; do
     
-    # 2. 处理简称：
-    # 将最后一个斜杠替换为冒号，这样 library/deepseek/latest 变成 library/deepseek:latest
-    # 同时保留中间的所有目录级（如 user/folder/model/tag -> user/folder/model:tag）
+    # 动态切除前缀逻辑：
+    # 匹配 .*/manifests/ 及其后的第一个目录(域名段)，只保留后面的模型标识
+    # 例如: /.../manifests/ollama.m.daocloud.io/library/deepseek-r1/latest
+    # 转换结果: library/deepseek-r1/latest
+    rel_path=$(echo "$file" | sed -n 's|.*/manifests/[^/]\+/||p')
+    
+    # 如果路径解析为空（比如不是合法的 manifest 文件），则跳过
+    [ -z "$rel_path" ] && continue
+    
+    # 格式化模型名称：将最后一个斜杠替换为冒号 (library/deepseek-r1:latest)
     model_tag=$(echo "$rel_path" | sed 's/\/\([^/]*\)$/:\1/')
     
-    # 3. 提取哈希并转换冒号为连字符 (sha256:xxx -> sha256-xxx)
+    # 提取 Blob Hash：取 JSON 中的第一个 digest 值，并将冒号换成连字符
+    # 匹配结果示例: sha256-c7f3ea903b50b3c9a42221b265ade4375d1bb5e3...
     raw_blob=$(grep -oP '"digest":"\K[^"]+' "$file" | head -n 1 | sed 's/:/-/g')
     
     if [ -n "$raw_blob" ]; then
         printf "%-50.50s %-75s\n" "$model_tag" "$raw_blob"
     fi
 done
-EOF
-
-    chmod +x "$DEST_PATH"
-    echo "成功！你可以直接运行: sudo ollama_blobs"
-    exit 0
-fi
