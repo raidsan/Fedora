@@ -23,8 +23,8 @@
 
 ```bash
 # 1. 设置源（官方源 或 镜像源）
-export GITHUB=[https://raw.githubusercontent.com](https://raw.githubusercontent.com)
-# 或 export GITHUB=[https://gh-proxy.com/raw.githubusercontent.com](https://gh-proxy.com/raw.githubusercontent.com)
+export GITHUB=https://raw.githubusercontent.com
+# 或 export GITHUB=https://gh-proxy.com/raw.githubusercontent.com
 
 # 2. 设置仓库主路径
 export MAIN=$GITHUB/raidsan/Fedora/refs/heads/main
