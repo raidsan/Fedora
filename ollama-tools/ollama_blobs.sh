@@ -41,33 +41,37 @@ BLOBS_DIR="$MODELS_ROOT/blobs"
 
 # --- 核心搜索逻辑 ---
 results=$( {
-    # 遍历 manifests 目录下所有 JSON 文件
     find "$MANIFEST_ROOT" -type f | while read -r file; do
         
-        # 1. 提取模型标签名 (处理路径，取最后两级)
+        # 1. 提取相对路径并解析标签
         rel_path=${file#$MANIFEST_ROOT/}
+        # 使用 awk 提取最后两级：模型/标签
         model_tag=$(echo "$rel_path" | awk -F'/' '{if(NF>=2) print $(NF-1)":"$NF}')
         
-        [ -z "$model_tag" ] && continue
+        # 【此处回答你的疑问】
+        # -z 确实能跳过 ""，但我们加上对 ":" 的检查更安全
+        # 这样如果 awk 只解析出一半，或者解析出空串，都会被拦住
+        if [ -z "$model_tag" ] || [[ ! "$model_tag" == *":"* ]]; then
+            continue
+        fi
+        
+        # 去掉常见的 library/ 前缀，保持输出简洁
         model_tag=${model_tag#library/}
 
         # 2. 关键字过滤
-        if [ -n "$KEYWORD" ] && [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
-            continue
+        if [ -n "$KEYWORD" ]; then
+            if [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
+                continue
+            fi
         fi
 
-        # 3. 【核心修复】精准提取 GGUF 权重哈希
-        # 在 manifest 中，只有 layer 的 mediaType 为 image.model 的才是权重文件
-        # 我们寻找匹配 image.model 后紧跟的 digest 行
-        raw_blob=$(grep -B 2 "image.model" "$file" | grep "digest" | grep -oP 'sha256:[a-f0-9]+' | sed 's/:/-/g')
-        
-        # 如果上面的匹配不到（取决于 JSON 格式换行），尝试备选匹配
-        if [ -z "$raw_blob" ]; then
-            raw_blob=$(grep -A 3 "image.model" "$file" | grep "digest" | grep -oP 'sha256:[a-f0-9]+' | sed 's/:/-/g')
-        fi
+        # 3. 精准提取权重哈希 (V8 验证过的逻辑)
+        # 只有在 JSON 中标记为 image.model 的哈希才是我们要的权重文件
+        raw_blob=$(cat "$file" | tr -d '\n' | grep -oP '\{[^{}]*?"mediaType":"application/vnd.ollama.image.model"[^{}]*?\}' | grep -oP 'sha256:[a-f0-9]+' | head -n 1 | sed 's/:/-/g')
 
-        # 4. 输出
-        if [ -n "$raw_blob" ]; then
+        # 4. 最终输出保护
+        # 确保名字和哈希同时存在，缺一不可
+        if [ -n "$model_tag" ] && [ -n "$raw_blob" ]; then
             if [ "$ONLY_PATH" = true ]; then
                 echo "$BLOBS_DIR/$raw_blob"
             else
