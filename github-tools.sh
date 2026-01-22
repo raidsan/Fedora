@@ -12,6 +12,7 @@
 TOOL_NAME="github-tools"
 DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
+# 元数据及文档存放至 share 目录
 META_DIR="/usr/local/share/github-tools-meta"
 
 # 确保元数据目录存在
@@ -48,14 +49,15 @@ get_file_mtime() {
     fi
 }
 
-# 下载并同步服务器时间
+# 下载并尝试同步服务器时间 (注：GitHub RAW 通常返回请求时间)
 download_with_mtime() {
     local url=$1
     local dest=$2
     local tmp_header=$(mktemp)
     
     if curl -sL -D "$tmp_header" "$url" -o "$dest"; then
-        # 提取 Last-Modified 并应用
+        # 提取 Last-Modified 并应用。虽然 GitHub 反馈的是请求时间，
+        # 但同步它可以确保本地文件 mtime 至少代表了最后一次校验的时间点。
         local remote_time=$(grep -i "last-modified:" "$tmp_header" | cut -d' ' -f2-)
         if [ -n "$remote_time" ]; then
             touch -d "$remote_time" "$dest"
@@ -94,27 +96,42 @@ save_metadata() {
     fi
 }
 
-# 安装/更新核心逻辑 (修复了误执行问题并加入时间同步)
+# 安装/更新核心逻辑 (修复重复更新逻辑：以 HASH 为准，时间仅作辅助显示)
 do_install() {
     local name=$1
     local url=$2
     local dest="$DEST_DIR/$name"
     local tmp_file=$(mktemp)
     
-    local old_time=$(get_file_mtime "$dest")
     echo "--- 正在处理: $name ---"
-    echo "本地版本时间: $old_time"
+    
+    # 获取本地哈希
+    local local_hash=""
+    [ -f "$dest" ] && local_hash=$(sha256sum "$dest" | cut -d' ' -f1)
+    
+    # 预下载并检查哈希
+    if curl -sL "$url" -o "$tmp_file"; then
+        local remote_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
+        
+        if [ "$local_hash" == "$remote_hash" ]; then
+            echo "[$name] 内容未变动，跳过更新。"
+            rm -f "$tmp_file"
+            return 0
+        fi
 
-    if download_with_mtime "$url" "$tmp_file"; then
-        local new_time=$(get_file_mtime "$tmp_file")
-        echo "远程版本时间: $new_time"
-
+        echo "检测到新版本，开始更新..."
+        echo "本地文件时间: $(get_file_mtime "$dest")"
+        
         if cat "$tmp_file" > "$dest" 2>/dev/null; then
             chmod +x "$dest"
-            touch -r "$tmp_file" "$dest"
+            # 同步下载时间（来自服务器 Header）
+            local remote_time=$(curl -sI "$url" | grep -i "last-modified:" | cut -d' ' -f2-)
+            [ -n "$remote_time" ] && touch -d "$remote_time" "$dest"
+            
+            echo "更新后时间: $(get_file_mtime "$dest")"
             save_metadata "$name" "$url"
             
-            # 同步 .md 文档
+            # 同步文档
             local doc_url="${url%.sh}.md"
             if curl --output /dev/null --silent --head --fail "$doc_url"; then
                 download_with_mtime "$doc_url" "$META_DIR/$name.md"
@@ -200,13 +217,11 @@ if [ "$1" == "update" ]; then
             LAST_LINE=$(tail -n 1 "$vfile")
             IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
             if [ "$T_NAME" == "$TOOL_NAME" ]; then SELF_URL="$T_URL"; continue; fi
-            REMOTE_H=$(curl -sL "$T_URL" | sha256sum | cut -d' ' -f1)
-            [ "$REMOTE_H" != "$T_HASH" ] && do_install "$T_NAME" "$T_URL" || echo "[$T_NAME] 已是最新。"
+            # 这里统一由 do_install 内部的哈希逻辑处理
+            do_install "$T_NAME" "$T_URL"
         done
         if [ -n "$SELF_URL" ]; then
-            REMOTE_H=$(curl -sL "$SELF_URL" | sha256sum | cut -d' ' -f1)
-            CUR_H=$(sha256sum "$DEST_PATH" | cut -d' ' -f1)
-            [ "$REMOTE_H" != "$CUR_H" ] && do_install "$TOOL_NAME" "$SELF_URL" || echo "[$TOOL_NAME] 已是最新。"
+            do_install "$TOOL_NAME" "$SELF_URL"
         fi
     fi
     echo ""; exit 0
