@@ -33,46 +33,45 @@ rocm-smi --showmeminfo vram gtt --json 2>/dev/null | jq -r '
 echo ""
 echo "--- 大模型应用进程资源统计 ---"
 
-# --- 第三阶段: 进程资源统计 ---
 format_gb() {
     echo "scale=2; $1 / 1048576" | bc | awk '{printf "%.2f GB", $0}'
 }
 
-# 打印表头
 printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" "PID" "NAME" "RAM(RSS)" "SWAP" "VRAM" "GTT"
 printf -- "------------------------------------------------------------------------------------------\n"
 
-pids=$(pgrep -d' ' -f "llama-server|ollama")
+# 查找所有相关进程
+pids=$(pgrep -f "llama-server|ollama")
 
 if [ -z "$pids" ]; then
     echo "(无运行中的大模型应用进程)"
 else
-    # 预抓取 GPU 进程信息
     gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
-    
+    active_flag=false
+
     for pid in $pids; do
         [ ! -d "/proc/$pid" ] && continue
-        pname=$(ps -p $pid -o comm= | cut -c1-20)
+        pname=$(ps -p $pid -o comm= | head -n1)
         ram_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
         swap_kb=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
         
         vram_val="0.00 GB"
         gtt_val="0.00 GB"
         
+        # 1. 尝试从 rocm-smi 提取
         if [ -n "$gpu_proc_info" ]; then
-            # 尝试从 rocm-smi 提取
             v_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
             g_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
-            
             [[ -n "$v_usage_b" && "$v_usage_b" != "0" ]] && vram_val=$(format_gb $((v_usage_b / 1024)))
             [[ -n "$g_usage_b" && "$g_usage_b" != "0" ]] && gtt_val=$(format_gb $((g_usage_b / 1024)))
         fi
 
-        # --- 补丁逻辑: 如果报 0，通过 lsof 强制校验 ---
+        # 2. 补丁：如果显示为 0，直接检查进程的文件描述符 (fd)
         if [[ "$vram_val" == "0.00 GB" ]]; then
-            if lsof -p "$pid" 2>/dev/null | grep -qE "renderD128|kfd"; then
-                # 如果持有设备句柄但数值为 0，标记为活跃占用
-                vram_val="*(Active)"
+            # 扫描进程是否打开了 GPU 字符设备
+            if ls -l /proc/$pid/fd 2>/dev/null | grep -qE "renderD128|kfd"; then
+                vram_val="[锁定显存]"
+                active_flag=true
             fi
         fi
 
@@ -81,7 +80,7 @@ else
     done
 fi
 
-# --- 第四阶段: 系统内存总结 ---
+# --- 系统内存总结 ---
 echo ""
 sys_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
@@ -89,10 +88,9 @@ sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
 printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
 
-# 补充提示
-if [[ "$vram_val" == "*(Active)" ]]; then
-    echo -e "\n\033[33m提示: 部分进程 (标记为 Active) 正在使用显存，但驱动程序未上报具体数值。\033[0m"
+if [ "$active_flag" = true ]; then
+    echo -e "\n\033[33m注: [锁定显存] 表示该进程正占用 GPU 硬件，但驱动未返回具体字节数。\033[0m"
 fi
 
-# 结尾空行
+# 结尾空行偏好
 echo ""
