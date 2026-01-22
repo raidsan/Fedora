@@ -4,22 +4,42 @@
 # 功能: github-tools 脚本管理器
 # 1. 帮助: sudo github-tools help / -v
 # 2. 列出: github-tools (不带参数)
-# 3. 新增: sudo github-tools add <URL> - 安装新脚本并同步 .md 文档，若同名则自动转为更新
+# 3. 新增: sudo github-tools add <URL> - 安装新脚本并同步 .md 文档
 # 4. 更新: sudo github-tools update - 全部更新 (自动检测 HASH 变动并同步文档)
-# 5. 更新: sudo github-tools update <名称> - 从版本记录提取 URL 执行单个更新
-# 6. 文档: 工具存储于 /usr/local/share/github-tools-meta/，支持工具带 -doc 参数查阅
+# 5. 文档: 工具存储于 /usr/local/share/github-tools-meta/，支持工具带 -doc 参数查阅
 # ==============================================================================
 
 TOOL_NAME="github-tools"
 DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
-# 修改：按照要求，元数据及文档存放至 share 目录
+# 元数据及文档存放至 share 目录
 META_DIR="/usr/local/share/github-tools-meta"
 
 # 确保元数据目录存在
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
+# --- 新增：文档查阅逻辑 ---
+show_doc() {
+    local doc_file="$META_DIR/$TOOL_NAME.md"
+    if [ ! -f "$doc_file" ]; then
+        echo "错误: 未找到对应的文档文件 ($doc_file)。"
+        exit 1
+    fi
+
+    if command -v glow >/dev/null 2>&1; then
+        glow "$doc_file"
+    elif command -v ghostwriter >/dev/null 2>&1; then
+        ghostwriter "$doc_file" &
+    else
+        echo "--- 文档内容开始 ---"
+        cat "$doc_file"
+        echo "--- 文档内容结束 ---"
+    fi
+    echo "" # 结尾空行
+    exit 0
+}
+
+# 追溯进程树捕获下载 URL
 get_download_url() {
     local pid=$$
     for i in {1..10}; do
@@ -70,7 +90,6 @@ do_install() {
     local status=0
     
     echo "--- 正在处理: $name ---"
-    
     if curl -sL "$url" -o "$tmp_file"; then
         if [ "$name" == "$TOOL_NAME" ]; then
             # 针对自身的权限捕获
@@ -99,7 +118,6 @@ do_install() {
         echo "错误: 下载失败 $url"
         status=1
     fi
-
     rm -f "$tmp_file"
     return $status
 }
@@ -109,12 +127,17 @@ show_help() {
     echo "用法: [sudo] $TOOL_NAME [命令]"
     echo ""
     echo "命令:"
-    echo "  (无参数)             列出所有已安装的工具、版本及文档状态"
+    echo "  (无参数)             列出所有已安装工具、版本及文档状态"
     echo "  help, -v             显示此帮助信息"
     echo "  sudo $TOOL_NAME add <URL>      安装新脚本。如果工具名已存在，则视为更新"
     echo "  sudo $TOOL_NAME update         更新所有已记录的工具 (自动同步文档，最后更新自身)"
     echo "  sudo $TOOL_NAME update <名称>  指定更新某个工具 (使用最后记录的 URL)"
 }
+
+# --- 检查 -doc 参数 ---
+for arg in "$@"; do
+    if [ "$arg" == "-doc" ]; then show_doc; fi
+done
 
 # --- 第一阶段: 管道自安装 (检测当前是否处于管道执行状态) ---
 if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
@@ -177,7 +200,7 @@ if [ "$1" == "add" ]; then
     exit 0
 fi
 
-# 4. update [名称]
+# 4. update
 if [ "$1" == "update" ]; then
     if [ -n "$2" ]; then
         # 更新指定工具
@@ -196,12 +219,9 @@ if [ "$1" == "update" ]; then
             [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
-            T_URL=$(echo "$LAST_LINE" | awk -F'\t' '{print $2}')
-            T_HASH=$(echo "$LAST_LINE" | awk -F'\t' '{print $3}')
+            IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
             [[ ! "$T_URL" =~ ^http ]] && continue
-            
             if [ "$T_NAME" == "$TOOL_NAME" ]; then SELF_URL="$T_URL"; continue; fi
-
             REMOTE_H=$(curl -sL "$T_URL" | sha256sum | cut -d' ' -f1)
             if [ "$REMOTE_H" != "$T_HASH" ]; then
                 do_install "$T_NAME" "$T_URL"
@@ -212,7 +232,7 @@ if [ "$1" == "update" ]; then
         
         # 最后执行自更新
         if [ -n "$SELF_URL" ]; then
-            CUR_H=$(sha256sum "$DEST_PATH" | cut -d' ' -f1)
+            read -r CUR_H _ < <(sha256sum "$DEST_PATH")
             REMOTE_H=$(curl -sL "$SELF_URL" | sha256sum | cut -d' ' -f1)
             [ "$REMOTE_H" != "$CUR_H" ] && do_install "$TOOL_NAME" "$SELF_URL" || echo "[$TOOL_NAME] 已是最新。"
         fi
