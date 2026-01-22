@@ -23,26 +23,29 @@ fi
 
 # --- 第三阶段: 核心提取函数 ---
 get_interface_info() {
-    local target_status="$1" # active 或 inactive
+    local target_mode="$1" # active 或 inactive
     local found=false
     
-    # 构建表头
     local header="连接名\t接口\tMAC地址\tIP/掩码\t网关\tDNS"
     local data_rows=""
 
-    # 遍历所有设备
-    while read -r dev type state con; do
-        [[ "$dev" == "DEVICE" || "$dev" == "lo" ]] && continue
+    # 使用 --terse 且指定字段，避免被输出截断或格式化干扰
+    # 状态字段使用 STATE，只要包含 "connected" 就算激活
+    while IFS=':' read -r dev type state con; do
+        [[ -z "$dev" || "$dev" == "DEVICE" || "$dev" == "lo" ]] && continue
         
-        # 判断激活状态
         local is_active=false
-        [[ "$state" == "connected" ]] && is_active=true
+        # 核心修复：模糊匹配 connected，涵盖外部托管连接
+        if [[ "$state" == connected* ]]; then
+            is_active=true
+        fi
         
-        if [[ "$target_status" == "active" && "$is_active" == false ]]; then continue; fi
-        if [[ "$target_status" == "inactive" && "$is_active" == true ]]; then continue; fi
+        # 根据请求模式过滤
+        if [[ "$target_mode" == "active" && "$is_active" == false ]]; then continue; fi
+        if [[ "$target_mode" == "inactive" && "$is_active" == true ]]; then continue; fi
 
-        # 提取数据
-        local name="${con:-[未连接]}"
+        # 提取详细信息
+        local name="${con:---}"
         local mac_raw=$(nmcli -t -g GENERAL.HWADDR device show "$dev" 2>/dev/null || echo "-")
         local mac=$(echo "$mac_raw" | sed 's/\\:/:/g')
         local ip_mask=$(nmcli -t -g IP4.ADDRESS device show "$dev" | head -1 || echo "-")
@@ -51,12 +54,14 @@ get_interface_info() {
 
         data_rows+="${name}\t${dev}\t${mac}\t${ip_mask:--}\t${gw}\t${dns:--}\n"
         found=true
-    done < <(nmcli device status)
+    done < <(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status)
 
     if [ "$found" = true ]; then
         (printf "$header\n$data_rows") | column -t -s $'\t'
     else
-        echo "未找到${target_status/active/激活的}${target_status/inactive/未激活的}网络接口"
+        local msg="已激活"
+        [[ "$target_mode" == "inactive" ]] && msg="未激活"
+        echo "未找到${msg}的网络接口"
     fi
 }
 
