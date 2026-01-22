@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # 名称: meminfo
-# 用途: 深度监控 GPU 资源。修复了 Maps 扫描时的 awk 语法错误。
+# 用途: 深度监控 GPU 资源。解决 ROCm 驱动下进程显存上报为 0 的探测问题。
 # ==============================================================================
 
 if [ "$EUID" -ne 0 ]; then
@@ -14,7 +14,7 @@ VERBOSE=false
 [[ "$1" == "-verbose" || "$1" == "--verbose" ]] && VERBOSE=true
 
 format_gb() {
-    # 简单的 GB 格式化输出
+    # 输入为 KB
     echo "scale=2; $1 / 1048576" | bc | awk '{printf "%.2f GB", $0}'
 }
 
@@ -60,22 +60,23 @@ else
         vram_bytes=0
         gtt_bytes=0
 
-        # 1. SMI 探测
+        # 1. SMI 探测 (主要来源)
         if [ -n "$gpu_proc_info" ] && [ "$gpu_proc_info" != "null" ]; then
             vram_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
             gtt_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
         fi
 
-        # 2. KFD 探测
+        # 2. KFD 探测 (针对驱动级锁定)
         if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
-            kfd_path="/sys/class/kfd/kfd/proc/$pid/mem_bank"
-            if [ -d "$kfd_path" ]; then
-                kfd_val=$(cat $kfd_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {print (s?s:0)}')
-                [[ "$kfd_val" -gt 0 ]] && vram_bytes=$kfd_val
+            kfd_mem_path="/sys/class/kfd/kfd/proc/$pid/mem_bank"
+            if [ -d "$kfd_mem_path" ]; then
+                # 累加所有 mem_bank 的 used_bytes
+                kfd_val=$(cat $kfd_mem_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+                [[ "$kfd_val" != "" && "$kfd_val" -gt 0 ]] && vram_bytes=$kfd_val
             fi
         fi
 
-        # 3. Maps 扩展扫描 (使用纯 awk 16进制转换，不调用外部 bc)
+        # 3. Maps 扩展扫描 (探测隐形映射)
         if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
             maps_data=$(grep -E "dev/kfd|dev/dri/render|amdgpu" /proc/$pid/maps 2>/dev/null)
             if [ -n "$maps_data" ]; then
@@ -89,19 +90,17 @@ else
                         }
                         return v;
                     }
-                    {
-                        sum += (hex2dec($2) - hex2dec($1));
-                    }
-                    END { printf "%0.f", sum }
+                    { sum += (hex2dec($2) - hex2dec($1)); }
+                    END { printf "%.0f", sum }
                 ')
-                [[ "$maps_bytes" -gt 0 ]] && vram_bytes=$maps_bytes
+                [[ "$maps_bytes" != "" && "$maps_bytes" -gt 0 ]] && vram_bytes=$maps_bytes
             fi
         fi
 
         v_display=$(format_gb $((vram_bytes / 1024)))
         g_display=$(format_gb $((gtt_bytes / 1024)))
 
-        # 兜底：如果还是 0 但明确有设备文件占用
+        # 兜底：如果算出来是 0 但确实有 fd 指向设备
         if [[ "$v_display" == "0.00 GB" ]]; then
             if ls -l /proc/$pid/fd 2>/dev/null | grep -qE "render|kfd"; then
                 v_display="[锁定显存]"
@@ -121,7 +120,7 @@ printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
 
 if [ "$active_flag" = true ]; then
-    echo -e "\n\033[33m注: [锁定显存] 表示驱动上报为0，数值尝试从 KFD/Maps 提取未果。\033[0m"
+    echo -e "\n\033[33m注: [锁定显存] 表示驱动已分配空间但对用户态隐藏了映射细节。\033[0m"
 fi
 
 echo ""
