@@ -75,7 +75,18 @@ save_metadata() {
     fi
 }
 
-# 安装/更新核心逻辑 (精简输出版)
+# 无缓存下载核心 (注入时间戳与请求头屏蔽 GitHub 缓存)
+curl_no_cache() {
+    local url=$1
+    local out=$2
+    local sep="?"
+    [[ "$url" == *\?* ]] && sep="&"
+    local fresh_url="${url}${sep}t=$(date +%s%N)"
+    
+    curl -sL -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
+}
+
+# 安装/更新核心逻辑 (精简输出版 + 防缓存)
 do_install() {
     local name=$1
     local url=$2
@@ -96,8 +107,8 @@ do_install() {
     local cur_hash=""
     [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
 
-    # 3. 获取远程文件
-    if ! curl -sL "$url" -o "$tmp_file"; then
+    # 3. 获取远程文件 (使用防缓存下载)
+    if ! curl_no_cache "$url" "$tmp_file"; then
         echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
     fi
     local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
@@ -126,12 +137,9 @@ do_install() {
             chmod +x "$dest"
             save_metadata "$name" "$url"
             
-            # 同步 .md 文档
+            # 同步 .md 文档 (同样使用防缓存下载)
             local doc_url="${url%.sh}.md"
-            if curl --output /dev/null --silent --head --fail "$doc_url"; then
-                curl -sL "$doc_url" -o "$META_DIR/$name.md"
-                echo "[$name] 说明文档已同步。"
-            fi
+            curl_no_cache "$doc_url" "$META_DIR/$name.md" >/dev/null 2>&1
             echo "✅ 已更新。"
         else
             echo "❌ 错误: 无法写入 $dest"
@@ -140,7 +148,7 @@ do_install() {
     rm -f "$tmp_file"
 }
 
-# 打印帮助信息 (略)
+# 打印帮助信息
 show_help() {
     echo "用法: [sudo] $TOOL_NAME [命令]"
     echo ""
