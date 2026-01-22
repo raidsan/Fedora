@@ -7,6 +7,7 @@
 #   [关键字]        可选，匹配模型名称
 #   --blob-path    可选，仅输出匹配到的 Blob 绝对路径 (需配合关键字使用)
 # ==============================================================================
+#!/bin/bash
 
 DEST_PATH="/usr/local/bin/ollama_blobs"
 
@@ -27,6 +28,7 @@ done
 
 # --- 路径确定 ---
 get_models_dir() {
+    # 优先检查探测到的进程环境，其次检查自定义路径
     local env_path=$(strings /proc/$(pgrep -x ollama | head -n 1)/environ 2>/dev/null | grep OLLAMA_MODELS | cut -d= -f2)
     [ -d "$env_path" ] && echo "$env_path" && return
     [ -d "/storage/models" ] && echo "/storage/models" && return
@@ -39,43 +41,43 @@ BLOBS_DIR="$MODELS_ROOT/blobs"
 
 # --- 核心搜索逻辑 ---
 results=$( {
-    # 限制最小深度为 3 (registry/user/model) 避开根目录干扰
-    find "$MANIFEST_ROOT" -mindepth 3 -type f -not -path "*/sha256/*" | while read -r file; do
+    # 遍历 manifests 目录下所有 JSON 文件
+    find "$MANIFEST_ROOT" -type f | while read -r file; do
         
-        # 提取相对路径
+        # 1. 提取模型标签名 (处理路径，取最后两级)
         rel_path=${file#$MANIFEST_ROOT/}
-        IFS='/' read -r -a parts <<< "$rel_path"
+        model_tag=$(echo "$rel_path" | awk -F'/' '{if(NF>=2) print $(NF-1)":"$NF}')
         
-        # 只要深度足够，取最后两段
-        if [ ${#parts[@]} -ge 2 ]; then
-            tag=${parts[-1]}
-            model=${parts[-2]}
-            model_tag="${model}:${tag}"
-            
-            # 过滤 library 前缀
-            model_tag=${model_tag#library/}
+        [ -z "$model_tag" ] && continue
+        model_tag=${model_tag#library/}
 
-            # 关键字过滤
-            if [ -n "$KEYWORD" ] && [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
-                continue
-            fi
+        # 2. 关键字过滤
+        if [ -n "$KEYWORD" ] && [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
+            continue
+        fi
 
-            # 提取权重 Blob
-            raw_blob=$(grep -A 5 "image.model" "$file" | grep -m 1 -oP 'sha256:[a-f0-9]+' | sed 's/:/-/g')
+        # 3. 【核心修复】精准提取 GGUF 权重哈希
+        # 在 manifest 中，只有 layer 的 mediaType 为 image.model 的才是权重文件
+        # 我们寻找匹配 image.model 后紧跟的 digest 行
+        raw_blob=$(grep -B 2 "image.model" "$file" | grep "digest" | grep -oP 'sha256:[a-f0-9]+' | sed 's/:/-/g')
+        
+        # 如果上面的匹配不到（取决于 JSON 格式换行），尝试备选匹配
+        if [ -z "$raw_blob" ]; then
+            raw_blob=$(grep -A 3 "image.model" "$file" | grep "digest" | grep -oP 'sha256:[a-f0-9]+' | sed 's/:/-/g')
+        fi
 
-            # 终极校验：必须有名字、有标签、有哈希才输出
-            if [[ "$model_tag" == *":"* ]] && [ -n "$raw_blob" ]; then
-                if [ "$ONLY_PATH" = true ]; then
-                    echo "$BLOBS_DIR/$raw_blob"
-                else
-                    printf "%-50s %-75s\n" "$model_tag" "$raw_blob"
-                fi
+        # 4. 输出
+        if [ -n "$raw_blob" ]; then
+            if [ "$ONLY_PATH" = true ]; then
+                echo "$BLOBS_DIR/$raw_blob"
+            else
+                printf "%-50s %-75s\n" "$model_tag" "$raw_blob"
             fi
         fi
     done
 } | sort -u )
 
-# --- 输出 ---
+# --- 最终输出 ---
 if [ "$ONLY_PATH" = true ]; then
     [ -n "$results" ] && echo "$results"
 else
