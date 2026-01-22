@@ -40,7 +40,6 @@ format_gb() {
 
 # 打印表头
 printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" "PID" "NAME" "RAM(RSS)" "SWAP" "VRAM" "GTT"
-# 修复此处：使用 -- 停止 printf 解析选项
 printf -- "------------------------------------------------------------------------------------------\n"
 
 pids=$(pgrep -d' ' -f "llama-server|ollama")
@@ -48,33 +47,52 @@ pids=$(pgrep -d' ' -f "llama-server|ollama")
 if [ -z "$pids" ]; then
     echo "(无运行中的大模型应用进程)"
 else
+    # 预抓取 GPU 进程信息
     gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
+    
     for pid in $pids; do
         [ ! -d "/proc/$pid" ] && continue
         pname=$(ps -p $pid -o comm= | cut -c1-20)
         ram_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
         swap_kb=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
         
-        vram_usage="0.00 GB"
-        gtt_usage="0.00 GB"
+        vram_val="0.00 GB"
+        gtt_val="0.00 GB"
         
         if [ -n "$gpu_proc_info" ]; then
-            # 兼容处理 PID 匹配，防止 jq 因为 PID 类型不一致报错
+            # 尝试从 rocm-smi 提取
             v_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
             g_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
-            [ -n "$v_usage_b" ] && [ "$v_usage_b" != "0" ] && vram_usage=$(format_gb $((v_usage_b / 1024)))
-            [ -n "$g_usage_b" ] && [ "$g_usage_b" != "0" ] && gtt_usage=$(format_gb $((g_usage_b / 1024)))
+            
+            [[ -n "$v_usage_b" && "$v_usage_b" != "0" ]] && vram_val=$(format_gb $((v_usage_b / 1024)))
+            [[ -n "$g_usage_b" && "$g_usage_b" != "0" ]] && gtt_val=$(format_gb $((g_usage_b / 1024)))
+        fi
+
+        # --- 补丁逻辑: 如果报 0，通过 lsof 强制校验 ---
+        if [[ "$vram_val" == "0.00 GB" ]]; then
+            if lsof -p "$pid" 2>/dev/null | grep -qE "renderD128|kfd"; then
+                # 如果持有设备句柄但数值为 0，标记为活跃占用
+                vram_val="*(Active)"
+            fi
         fi
 
         printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" \
-            "$pid" "$pname" "$(format_gb ${ram_kb:-0})" "$(format_gb ${swap_kb:-0})" "$vram_usage" "$gtt_usage"
+            "$pid" "$pname" "$(format_gb ${ram_kb:-0})" "$(format_gb ${swap_kb:-0})" "$vram_val" "$gtt_val"
     done
 fi
 
 # --- 第四阶段: 系统内存总结 ---
 echo ""
 sys_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}') # 使用 Available 比 Free 更准确
+sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
 
 printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
+
+# 补充提示
+if [[ "$vram_val" == "*(Active)" ]]; then
+    echo -e "\n\033[33m提示: 部分进程 (标记为 Active) 正在使用显存，但驱动程序未上报具体数值。\033[0m"
+fi
+
+# 结尾空行
+echo ""
