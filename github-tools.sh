@@ -12,7 +12,6 @@
 TOOL_NAME="github-tools"
 DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
-# 元数据及文档存放至 share 目录
 META_DIR="/usr/local/share/github-tools-meta"
 
 # 确保元数据目录存在
@@ -37,36 +36,6 @@ show_doc() {
     fi
     echo ""
     exit 0
-}
-
-# 获取文件修改时间
-get_file_mtime() {
-    local file=$1
-    if [ -f "$file" ]; then
-        date -r "$file" "+%Y-%m-%d %H:%M:%S"
-    else
-        echo "不存在"
-    fi
-}
-
-# 下载并尝试同步服务器时间 (注：GitHub RAW 通常返回请求时间)
-download_with_mtime() {
-    local url=$1
-    local dest=$2
-    local tmp_header=$(mktemp)
-    
-    if curl -sL -D "$tmp_header" "$url" -o "$dest"; then
-        # 提取 Last-Modified 并应用。虽然 GitHub 反馈的是请求时间，
-        # 但同步它可以确保本地文件 mtime 至少代表了最后一次校验的时间点。
-        local remote_time=$(grep -i "last-modified:" "$tmp_header" | cut -d' ' -f2-)
-        if [ -n "$remote_time" ]; then
-            touch -d "$remote_time" "$dest"
-        fi
-        rm -f "$tmp_header"
-        return 0
-    fi
-    rm -f "$tmp_header"
-    return 1
 }
 
 # 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
@@ -96,53 +65,71 @@ save_metadata() {
     fi
 }
 
-# 安装/更新核心逻辑 (修复重复更新逻辑：以 HASH 为准，时间仅作辅助显示)
+# 安装/更新核心逻辑 (三方哈希比对)
 do_install() {
     local name=$1
     local url=$2
     local dest="$DEST_DIR/$name"
+    local v_file="$META_DIR/$name.version"
     local tmp_file=$(mktemp)
     
     echo "--- 正在处理: $name ---"
     
-    # 获取本地哈希
-    local local_hash=""
-    [ -f "$dest" ] && local_hash=$(sha256sum "$dest" | cut -d' ' -f1)
-    
-    # 预下载并检查哈希
-    if curl -sL "$url" -o "$tmp_file"; then
-        local remote_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
-        
-        if [ "$local_hash" == "$remote_hash" ]; then
-            echo "[$name] 内容未变动，跳过更新。"
-            rm -f "$tmp_file"
-            return 0
+    # 1. 提取本地记录 Hash (Last Recorded Hash)
+    local rec_hash=""
+    local rec_time=""
+    if [ -f "$v_file" ]; then
+        IFS=$'\t' read -r rec_time _ rec_hash <<< "$(tail -n 1 "$v_file")"
+    fi
+
+    # 2. 提取本地文件当前 Hash (Local File Hash)
+    local cur_hash=""
+    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
+
+    # 3. 提取远程文件 Hash (Remote Hash)
+    if ! curl -sL "$url" -o "$tmp_file"; then
+        echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
+    fi
+    local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
+
+    # --- 逻辑判定矩阵 ---
+    if [ "$rem_hash" == "$rec_hash" ]; then
+        # 情况：远程没更新
+        if [ "$cur_hash" == "$rec_hash" ]; then
+            echo "没有新版本。 (上次更新: $rec_time)"
+        else
+            echo "⚠️  远程内容未更新，但本地文件已被外部修改，不作处理。"
+        fi
+        rm -f "$tmp_file"; return 0
+    else
+        # 情况：远程已更新
+        if [ -f "$dest" ] && [ "$cur_hash" != "$rec_hash" ]; then
+            # 本地亦有修改，需询问
+            echo "⚠️  检测到远程更新，但本地文件已被外部修改。"
+            read -p "是否使用远程版本覆盖本地修改？(y/n): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "操作已取消。"
+                rm -f "$tmp_file"; return 0
+            fi
+        else
+            echo "检测到新版本。"
         fi
 
-        echo "检测到新版本，开始更新..."
-        echo "本地文件时间: $(get_file_mtime "$dest")"
-        
+        # 执行物理更新
         if cat "$tmp_file" > "$dest" 2>/dev/null; then
             chmod +x "$dest"
-            # 同步下载时间（来自服务器 Header）
-            local remote_time=$(curl -sI "$url" | grep -i "last-modified:" | cut -d' ' -f2-)
-            [ -n "$remote_time" ] && touch -d "$remote_time" "$dest"
-            
-            echo "更新后时间: $(get_file_mtime "$dest")"
             save_metadata "$name" "$url"
             
-            # 同步文档
+            # 同步 .md 文档 (如果存在)
             local doc_url="${url%.sh}.md"
             if curl --output /dev/null --silent --head --fail "$doc_url"; then
-                download_with_mtime "$doc_url" "$META_DIR/$name.md"
+                curl -sL "$doc_url" -o "$META_DIR/$name.md"
                 echo "[$name] 说明文档已同步。"
             fi
-            echo "✅ [$name] 更新成功。"
+            echo "✅ 已更新。"
         else
-            echo "❌ 错误: 写入 $dest 失败。"
+            echo "❌ 错误: 无法写入 $dest"
         fi
-    else
-        echo "❌ 错误: 下载失败 $url"
     fi
     rm -f "$tmp_file"
 }
@@ -217,14 +204,10 @@ if [ "$1" == "update" ]; then
             LAST_LINE=$(tail -n 1 "$vfile")
             IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
             if [ "$T_NAME" == "$TOOL_NAME" ]; then SELF_URL="$T_URL"; continue; fi
-            # 这里统一由 do_install 内部的哈希逻辑处理
             do_install "$T_NAME" "$T_URL"
         done
         if [ -n "$SELF_URL" ]; then
             do_install "$TOOL_NAME" "$SELF_URL"
         fi
     fi
-    echo ""; exit 0
-fi
-
-echo ""
+    echo ""; exit
