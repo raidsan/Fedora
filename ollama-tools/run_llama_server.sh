@@ -36,7 +36,6 @@ find_llama_bin() {
     elif [ -f "$HOME/llama.cpp/build/bin/llama-server" ]; then
         echo "$HOME/llama.cpp/build/bin/llama-server"
     else
-        # 默认返回空，由逻辑判断报错
         echo ""
     fi
 }
@@ -130,6 +129,7 @@ fi
 echo "--------------------------------------------------"
 echo "程序路径: $LLAMA_BIN"
 echo "模型路径: $MODEL_PATH"
+echo "模型别名: $MODEL_KEYWORD"
 echo "服务端口: $PORT"
 echo "上下文  : $CTX_INPUT ($CTX_SIZE)"
 echo "--------------------------------------------------"
@@ -139,7 +139,10 @@ export LLAMA_ARG_HOST=0.0.0.0
 
 exec "$LLAMA_BIN" \
     -m "$MODEL_PATH" \
+    --alias "$MODEL_KEYWORD" \
     --n-gpu-layers 999 \
     --port "$PORT" \
     -c "$CTX_SIZE" \
     --verbose
+
+echo ""
