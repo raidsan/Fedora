@@ -2,15 +2,14 @@
 
 # ==============================================================================
 # 名称: run_llama_server
-# 用途: 自动查找 Ollama 模型并启动 llama-server (支持端口和上下文自定义)
-# 管理: 建议通过 github-tools 安装/更新
-# 用法: run_llama_server <模型关键字> [端口] [上下文] [程序路径]
+# 用途: 自动查找 Ollama 模型并启动 llama-server (支持 -p, -c 及 k 换算)
+# 用法: run_llama_server <模型关键字> [-p 端口] [-c 上下文] [--bin 程序路径]
 # ==============================================================================
 
 DEST_PATH="/usr/local/bin/run_llama_server"
 DEFAULT_BIN="$HOME/llama.cpp/build/bin/llama-server"
 
-# --- 第一阶段: 安装逻辑 (供 github-tools 使用) ---
+# --- 第一阶段: 安装逻辑 ---
 if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
     if [ "$EUID" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
     cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
@@ -18,29 +17,72 @@ if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tm
     exit 0
 fi
 
-# --- 第二阶段: 参数解析 ---
-# 参数位说明：
-# $1: 模型关键字 (必填)
-# $2: 端口 (可选，缺省 8080)
-# $3: 上下文长度 (可选，缺省 8192)
-# $4: 程序路径 (可选，缺省 ~/llama.cpp/build/bin/llama-server)
+# --- 第二阶段: 辅助函数 ---
 
-if [ -z "$1" ] || [ "$1" == "help" ]; then
-    echo "用法: run_llama_server <模型关键字> [端口] [上下文] [程序路径]"
-    echo "示例: run_llama_server qwen 8081 16384"
+# 将 k 格式转换为数字 (例如 8k -> 8192)
+parse_context_size() {
+    local input=$1
+    if [[ "$input" =~ ^([0-9]+)[kK]$ ]]; then
+        local num=${BASH_REMATCH[1]}
+        echo $((num * 1024))
+    else
+        echo "$input"
+    fi
+}
+
+# --- 第三阶段: 参数解析 ---
+
+MODEL_KEYWORD=""
+PORT="8080"
+CTX_INPUT="8192"
+LLAMA_BIN="$DEFAULT_BIN"
+
+# 提取第一个参数作为模型关键字 (如果它不是以 - 开头)
+if [[ -n "$1" && ! "$1" =~ ^- ]]; then
+    MODEL_KEYWORD="$1"
+    shift
+fi
+
+# 解析剩余的标志位参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p)
+            PORT="$2"
+            shift 2
+            ;;
+        -c)
+            CTX_INPUT="$2"
+            shift 2
+            ;;
+        --bin)
+            LLAMA_BIN="$2"
+            shift 2
+            ;;
+        *)
+            # 如果之前没拿到关键字，这里也可以拿
+            if [ -z "$MODEL_KEYWORD" ]; then
+                MODEL_KEYWORD="$1"
+                shift
+            else
+                echo "未知参数: $1"
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$MODEL_KEYWORD" ]; then
+    echo "用法: run_llama_server <模型关键字> [-p 端口] [-c 上下文(如 8k)] [--bin 程序路径]"
     exit 1
 fi
 
-MODEL_KEYWORD="$1"
-PORT="${2:-8080}"
-CTX_SIZE="${3:-8192}"
-LLAMA_BIN="${4:-$DEFAULT_BIN}"
+CTX_SIZE=$(parse_context_size "$CTX_INPUT")
 
-# --- 第三阶段: 核心逻辑 ---
+# --- 第四阶段: 核心运行逻辑 ---
 
-# 1. 检查依赖与程序
+# 1. 检查依赖
 if ! command -v ollama_blobs >/dev/null 2>&1; then
-    echo "错误: 未检测到 ollama_blobs，请先安装它。"
+    echo "错误: 未检测到 ollama_blobs。"
     exit 1
 fi
 
@@ -50,7 +92,6 @@ if [ ! -f "$LLAMA_BIN" ]; then
 fi
 
 # 2. 获取模型路径
-echo "正在搜索模型: $MODEL_KEYWORD ..."
 MODEL_PATH=$(ollama_blobs "$MODEL_KEYWORD" --blob-path)
 COUNT=$(echo "$MODEL_PATH" | grep -c "sha256-")
 
@@ -63,18 +104,15 @@ elif [ "$COUNT" -gt 1 ]; then
     exit 1
 fi
 
-# 3. 配置并启动
+# 3. 启动
 echo "--------------------------------------------------"
 echo "模型路径: $MODEL_PATH"
 echo "监听端口: $PORT"
-echo "上下文  : $CTX_SIZE"
-echo "程序路径: $LLAMA_BIN"
+echo "上下文  : $CTX_INPUT -> $CTX_SIZE"
 echo "--------------------------------------------------"
 
-# 强制环境变量
 export LLAMA_ARG_HOST=0.0.0.0
 
-# 启动程序
 exec "$LLAMA_BIN" \
     -m "$MODEL_PATH" \
     --n-gpu-layers 999 \
