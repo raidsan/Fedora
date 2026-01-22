@@ -1,27 +1,35 @@
 #!/bin/bash
 
 # ==============================================================================
-# 名称: meminfo
-# 用途: 深度监控 GPU 资源。解决 ROCm 驱动下进程显存上报为 0 的探测问题。
+# 名称: meminfo (全路径探测版)
+# 功能: 自动适配并尝试所有可能的显存统计路径，取最大有效值。
 # ==============================================================================
 
-if [ "$EUID" -ne 0 ]; then
-    echo "错误: 必须使用 sudo 权限运行。"
-    exit 1
-fi
+if [ "$EUID" -ne 0 ]; then echo "错误: 必须使用 sudo 权限运行。"; exit 1; fi
 
 VERBOSE=false
 [[ "$1" == "-verbose" || "$1" == "--verbose" ]] && VERBOSE=true
 
+# 内部计算函数 (KB -> GB)
 format_gb() {
-    # 输入为 KB
     echo "scale=2; $1 / 1048576" | bc | awk '{printf "%.2f GB", $0}'
 }
 
-# --- 第一阶段: GPU 显存总览 ---
+# 16进制转10进制大数处理
+hex2dec() {
+    echo "$1" | awk '{
+        v = 0; len = length($0);
+        for (i = 1; i <= len; i++) {
+            c = tolower(substr($0, i, 1));
+            v = v * 16 + (index("0123456789abcdef", c) - 1);
+        }
+        printf "%.0f", v
+    }'
+}
+
 echo "--- GPU 内存概览 ---"
 GPU_JSON=$(rocm-smi --showmeminfo vram gtt --json 2>/dev/null)
-[ "$VERBOSE" = true ] && echo "[DEBUG] rocm-smi 显存 JSON: $GPU_JSON"
+[ "$VERBOSE" = true ] && echo "[DEBUG] SMI 总览: $GPU_JSON"
 
 echo "$GPU_JSON" | jq -r '
   to_entries[] | .key as $gpu | .value | 
@@ -33,8 +41,7 @@ echo "$GPU_JSON" | jq -r '
     [$gpu, "VRAM", to_gb($v_t), to_gb($v_u), to_gb($v_t - $v_u)],
     [$gpu, "GTT", to_gb($g_t), to_gb($g_u), to_gb($g_t - $g_u)],
     ["SUM", "Total_Pool", to_gb($v_t + $g_t), to_gb($v_u + $g_u), to_gb(($v_t + $g_t) - ($v_u + $g_u))]
-  ) | @tsv
-' | column -t -s $'\t' --table-columns GPU,TYPE,TOTAL,USED,FREE
+  ) | @tsv' 2>/dev/null | column -t -s $'\t' --table-columns GPU,TYPE,TOTAL,USED,FREE
 
 echo ""
 echo "--- 大模型应用进程资源统计 ---"
@@ -42,85 +49,62 @@ printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" "PID" "NAME" "RAM(RSS)" "SWAP" "V
 printf -- "------------------------------------------------------------------------------------------\n"
 
 pids=$(pgrep -f "llama-server|ollama")
+gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
 
-if [ -z "$pids" ]; then
-    echo "(无运行中的大模型应用进程)"
-else
-    gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
-    active_flag=false
+for pid in $pids; do
+    [ ! -d "/proc/$pid" ] && continue
+    pname=$(ps -p $pid -o comm= | head -n1)
+    ram_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
+    swap_kb=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
+    
+    # --- 多路探测逻辑开始 ---
+    V_SMI=0; V_KFD=0; V_MAPS=0; V_SYS=0
+    G_SMI=0
 
-    for pid in $pids; do
-        [ ! -d "/proc/$pid" ] && continue
-        pname=$(ps -p $pid -o comm= | head -n1)
-        [ "$VERBOSE" = true ] && echo "[DEBUG] 正在分析进程: $pname (PID: $pid)"
-        
-        ram_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
-        swap_kb=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
-        
-        vram_bytes=0
-        gtt_bytes=0
+    # 路径 A: ROCm-SMI 官方接口
+    if [ -n "$gpu_proc_info" ] && [ "$gpu_proc_info" != "null" ]; then
+        V_SMI=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
+        G_SMI=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
+    fi
 
-        # 1. SMI 探测 (主要来源)
-        if [ -n "$gpu_proc_info" ] && [ "$gpu_proc_info" != "null" ]; then
-            vram_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
-            gtt_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
-        fi
+    # 路径 B: KFD mem_bank 统计 (针对某些驱动版本有效)
+    if [ -d "/sys/class/kfd/kfd/proc/$pid/mem_bank" ]; then
+        V_KFD=$(cat /sys/class/kfd/kfd/proc/$pid/mem_bank/*/used_bytes 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+    fi
 
-        # 2. KFD 探测 (针对驱动级锁定)
-        if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
-            kfd_mem_path="/sys/class/kfd/kfd/proc/$pid/mem_bank"
-            if [ -d "$kfd_mem_path" ]; then
-                # 累加所有 mem_bank 的 used_bytes
-                kfd_val=$(cat $kfd_mem_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
-                [[ "$kfd_val" != "" && "$kfd_val" -gt 0 ]] && vram_bytes=$kfd_val
-            fi
-        fi
+    # 路径 C: Sysfs 物理属性探测 (最底层，解析物理堆分配)
+    if [ -d "/sys/class/kfd/kfd/proc/$pid/mem_bank" ]; then
+        V_SYS=$(grep -h "size_in_bytes" /sys/class/kfd/kfd/proc/$pid/mem_bank/*/properties 2>/dev/null | awk '{s+=$2} END {printf "%.0f", s}')
+    fi
 
-        # 3. Maps 扩展扫描 (探测隐形映射)
-        if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
-            maps_data=$(grep -E "dev/kfd|dev/dri/render|amdgpu" /proc/$pid/maps 2>/dev/null)
-            if [ -n "$maps_data" ]; then
-                [ "$VERBOSE" = true ] && echo "[DEBUG] 命中映射段，执行内部转换..."
-                maps_bytes=$(echo "$maps_data" | awk -F'[- ]' '
-                    function hex2dec(h,   i, v, len, c) {
-                        v = 0; len = length(h);
-                        for (i = 1; i <= len; i++) {
-                            c = tolower(substr(h, i, 1));
-                            v = v * 16 + (index("0123456789abcdef", c) - 1);
-                        }
-                        return v;
-                    }
-                    { sum += (hex2dec($2) - hex2dec($1)); }
-                    END { printf "%.0f", sum }
-                ')
-                [[ "$maps_bytes" != "" && "$maps_bytes" -gt 0 ]] && vram_bytes=$maps_bytes
-            fi
-        fi
+    # 路径 D: Maps 暴力扫描 (捕获显式映射)
+    maps_data=$(grep -E "dev/kfd|dev/dri/render|amdgpu" /proc/$pid/maps 2>/dev/null)
+    if [ -n "$maps_data" ]; then
+        V_MAPS=$(echo "$maps_data" | awk -F'[- ]' '
+            function h2d(h, i, v, l, c) { v=0; l=length(h); for(i=1;i<=l;i++){ c=tolower(substr(h,i,1)); v=v*16+(index("0123456789abcdef",c)-1); } return v; }
+            { sum += (h2d($2) - h2d($1)); } END { printf "%.0f", sum }')
+    fi
 
-        v_display=$(format_gb $((vram_bytes / 1024)))
-        g_display=$(format_gb $((gtt_bytes / 1024)))
+    # --- 决策逻辑：自动取所有方案的最大值 ---
+    # 为什么要取最大？因为不同接口可能只上报了部分显存（如只上报了映射部分，或只上报了物理部分）
+    final_vram_b=$(printf "%s\n%s\n%s\n%s\n" "$V_SMI" "$V_KFD" "$V_SYS" "$V_MAPS" | sort -rn | head -1)
+    
+    [ "$VERBOSE" = true ] && echo "[DEBUG] PID $pid: SMI=$V_SMI, KFD=$V_KFD, SYS=$V_SYS, MAPS=$V_MAPS -> 选定: $final_vram_b"
 
-        # 兜底：如果算出来是 0 但确实有 fd 指向设备
-        if [[ "$v_display" == "0.00 GB" ]]; then
-            if ls -l /proc/$pid/fd 2>/dev/null | grep -qE "render|kfd"; then
-                v_display="[锁定显存]"
-                active_flag=true
-            fi
-        fi
+    v_out=$(format_gb $((final_vram_b / 1024)))
+    g_out=$(format_gb $((G_SMI / 1024)))
 
-        printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" \
-            "$pid" "$pname" "$(format_gb ${ram_kb:-0})" "$(format_gb ${swap_kb:-0})" "$v_display" "$g_display"
-    done
-fi
+    # 最终防御：如果算出来还是0，但有设备文件句柄，标记为锁定
+    if [[ "$v_out" == "0.00 GB" ]] && ls -l /proc/$pid/fd 2>/dev/null | grep -qE "render|kfd"; then
+        v_out="[锁定显存]"
+    fi
+
+    printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" "$pid" "$pname" "$(format_gb ${ram_kb:-0})" "$(format_gb ${swap_kb:-0})" "$v_out" "$g_out"
+done
 
 echo ""
 sys_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
 printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
-
-if [ "$active_flag" = true ]; then
-    echo -e "\n\033[33m注: [锁定显存] 表示驱动已分配空间但对用户态隐藏了映射细节。\033[0m"
-fi
-
 echo ""
