@@ -3,11 +3,11 @@
 # ==============================================================================
 # 名称: meminfo
 # 用途: 监控 GPU 显存(VRAM/GTT)及大模型服务(llama/ollama)的资源占用
-# 改进: 深度监控 GPU 资源。利用内核 KFD 接口修复驱动上报不准的问题，支持多模型统计。
+# 改进: 深度监控 GPU 资源。集成 [驱动/KFD内核/进程映射] 三级探测，解决显存显示为 0 的难题。
 # ==============================================================================
 
 if [ "$EUID" -ne 0 ]; then
-    echo "错误: 必须使用 sudo 权限运行以访问内核 KFD 统计接口。"
+    echo "错误: 必须使用 sudo 权限运行以访问内核统计及进程映射。"
     exit 1
 fi
 
@@ -43,7 +43,6 @@ pids=$(pgrep -f "llama-server|ollama")
 if [ -z "$pids" ]; then
     echo "(无运行中的大模型应用进程)"
 else
-    # 预抓取驱动层 JSON (作为第一数据源)
     gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
     active_flag=false
 
@@ -56,28 +55,35 @@ else
         vram_bytes=0
         gtt_bytes=0
 
-        # 1. 优先尝试从驱动上报提取
+        # 1. 第一优先级：驱动层上报
         if [ -n "$gpu_proc_info" ] && [ "$gpu_proc_info" != "null" ]; then
             vram_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
             gtt_bytes=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
         fi
 
-        # 2. 深度探测补丁：如果驱动报 0，则潜入内核 KFD 目录
+        # 2. 第二优先级：内核 KFD 统计 (AMD GPU 专用路径)
         if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
-            # KFD 统计路径包含所有 bank 占用 (VRAM/GTT 都在里面)
             kfd_proc_path="/sys/class/kfd/kfd/proc/$pid/mem_bank"
             if [ -d "$kfd_proc_path" ]; then
-                # 累加所有 bank 的已用字节并转为 KB (bc 运算需要)
-                total_kfd_bytes=$(cat $kfd_proc_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {print (s?s:0)}')
-                vram_bytes=$total_kfd_bytes
+                vram_bytes=$(cat $kfd_proc_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {print (s?s:0)}')
             fi
         fi
 
-        # 3. 结果显示逻辑
+        # 3. 第三优先级：扫描进程 Maps (映射段统计)
+        # 很多 LLM 进程会将显存映射为巨大的内存段，关键词通常包含 /dev/kfd 或设备节点
+        if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
+            # 统计所有关联设备映射的虚拟内存段大小 (16进制计算)
+            vram_bytes=$(grep -E "dev/kfd|dev/dri/renderD128" /proc/$pid/maps 2>/dev/null | awk -F'[- ]' '{
+                "echo \"obase=10; ibase=16; "toupper($2)"-"toupper($1)"\" | bc" | getline diff;
+                sum += diff;
+            } END {print (sum?sum:0)}')
+        fi
+
+        # 4. 结果显示
         v_display=$(format_gb $((vram_bytes / 1024)))
         g_display=$(format_gb $((gtt_bytes / 1024)))
 
-        # 降级保护：如果还是 0 但确实有 fd 指向 GPU 设备
+        # 终极保底显示
         if [[ "$v_display" == "0.00 GB" ]]; then
             if ls -l /proc/$pid/fd 2>/dev/null | grep -qE "renderD128|kfd"; then
                 v_display="[锁定显存]"
@@ -99,7 +105,8 @@ printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
 
 if [ "$active_flag" = true ]; then
-    echo -e "\n\033[33m注: [锁定显存] 表示驱动未上报精确值，当前已尝试通过内核 KFD 接口获取，请检查数值。\033[0m"
+    echo -e "\n\033[33m注: [锁定显存] 表示驱动未上报，当前数值已尝试通过 KFD/Maps 深度扫描提取。\033[0m"
 fi
 
+# 遵守用户输出偏好：结尾多一个空行
 echo ""
