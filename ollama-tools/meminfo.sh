@@ -15,7 +15,7 @@ if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tm
     exit 0
 fi
 
-# --- 第二阶段: GPU 显存统计 (VRAM/GTT) ---
+# --- 第二阶段: GPU 显存统计 ---
 echo "--- GPU 内存概览 ---"
 rocm-smi --showmeminfo vram gtt --json 2>/dev/null | jq -r '
   to_entries[] | .key as $gpu | .value | 
@@ -24,62 +24,57 @@ rocm-smi --showmeminfo vram gtt --json 2>/dev/null | jq -r '
   (safe_num(."GTT Total Memory (B)")) as $g_t | (safe_num(."GTT Total Used Memory (B)")) as $g_u |
   def to_gb(x): (x / 1073741824 | . * 100 | round / 100 | tostring + " GB");
   (
-    [$gpu, "VRAM", to_gb($v_t), to_gb($v_u)],
-    [$gpu, "GTT", to_gb($g_t), to_gb($g_u)],
-    ["SUM", "Total_Pool", to_gb($v_t + $g_t), to_gb($v_u + $g_u)]
+    [$gpu, "VRAM", to_gb($v_t), to_gb($v_u), to_gb($v_t - $v_u)],
+    [$gpu, "GTT", to_gb($g_t), to_gb($g_u), to_gb($g_t - $g_u)],
+    ["SUM", "Total_Pool", to_gb($v_t + $g_t), to_gb($v_u + $g_u), to_gb(($v_t + $g_t) - ($v_u + $g_u))]
   ) | @tsv
-' | column -t -s $'\t' --table-columns GPU,TYPE,TOTAL,USED
+' | column -t -s $'\t' --table-columns GPU,TYPE,TOTAL,USED,FREE
 
 echo ""
 echo "--- 大模型应用进程资源统计 ---"
 
-# --- 第三阶段: 进程资源统计 (llama-server/ollama) ---
-# 定义转换 GB 的函数
+# --- 第三阶段: 进程资源统计 ---
 format_gb() {
     echo "scale=2; $1 / 1048576" | bc | awk '{printf "%.2f GB", $0}'
 }
 
 # 打印表头
 printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" "PID" "NAME" "RAM(RSS)" "SWAP" "VRAM" "GTT"
-printf "------------------------------------------------------------------------------------------\n"
+# 修复此处：使用 -- 停止 printf 解析选项
+printf -- "------------------------------------------------------------------------------------------\n"
 
-# 获取所有 llama-server 和 ollama 进程
 pids=$(pgrep -d' ' -f "llama-server|ollama")
 
 if [ -z "$pids" ]; then
     echo "(无运行中的大模型应用进程)"
 else
-    # 获取 GPU 进程详细信息 (用于提取 VRAM/GTT 占用)
     gpu_proc_info=$(rocm-smi --showpids --json 2>/dev/null)
-
     for pid in $pids; do
-        # 1. 基础信息
+        [ ! -d "/proc/$pid" ] && continue
         pname=$(ps -p $pid -o comm= | cut -c1-20)
-        
-        # 2. 从 /proc 提取 RAM 和 SWAP (单位为 KB)
-        # VmRSS: 实际物理内存, VmSwap: 交换分区
         ram_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
         swap_kb=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
         
-        [ -z "$ram_kb" ] && ram_kb=0
-        [ -z "$swap_kb" ] && swap_kb=0
-
-        # 3. 从 rocm-smi 提取显存 (如果有)
-        # 注意：rocm-smi 输出的进程显存单位通常是字节或KB，此处需匹配 PID
         vram_usage="0.00 GB"
         gtt_usage="0.00 GB"
         
         if [ -n "$gpu_proc_info" ]; then
-            # 解析该 PID 对应的 VRAM 和 GTT
-            vram_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID == \"$pid\") | .\"VRAM Usage (B)\" // 0")
-            gtt_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID == \"$pid\") | .\"GTT Usage (B)\" // 0")
-            
-            [ -n "$vram_b" ] && [ "$vram_b" != "0" ] && vram_usage=$(format_gb $((vram_b / 1024)))
-            [ -n "$gtt_b" ] && [ "$gtt_b" != "0" ] && gtt_usage=$(format_gb $((gtt_b / 1024)))
+            # 兼容处理 PID 匹配，防止 jq 因为 PID 类型不一致报错
+            v_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"VRAM Usage (B)\" // 0" 2>/dev/null)
+            g_usage_b=$(echo "$gpu_proc_info" | jq -r ".[] | select(.PID|tostring == \"$pid\") | .\"GTT Usage (B)\" // 0" 2>/dev/null)
+            [ -n "$v_usage_b" ] && [ "$v_usage_b" != "0" ] && vram_usage=$(format_gb $((v_usage_b / 1024)))
+            [ -n "$g_usage_b" ] && [ "$g_usage_b" != "0" ] && gtt_usage=$(format_gb $((g_usage_b / 1024)))
         fi
 
-        # 4. 格式化输出
         printf "%-10s %-20s %-12s %-12s %-12s %-12s\n" \
-            "$pid" "$pname" "$(format_gb $ram_kb)" "$(format_gb $swap_kb)" "$vram_usage" "$gtt_usage"
+            "$pid" "$pname" "$(format_gb ${ram_kb:-0})" "$(format_gb ${swap_kb:-0})" "$vram_usage" "$gtt_usage"
     done
 fi
+
+# --- 第四阶段: 系统内存总结 ---
+echo ""
+sys_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}') # 使用 Available 比 Free 更准确
+
+printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
+printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
