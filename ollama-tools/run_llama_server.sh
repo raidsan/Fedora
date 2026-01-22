@@ -2,12 +2,11 @@
 
 # ==============================================================================
 # 名称: run_llama_server
-# 用途: 自动查找 Ollama 模型并启动 llama-server (支持 -p, -c 及 k 换算)
+# 用途: 自动查找 Ollama 模型并启动 llama-server (支持多路径搜索及单位换算)
 # 用法: run_llama_server <模型关键字> [-p 端口] [-c 上下文] [--bin 程序路径]
 # ==============================================================================
 
 DEST_PATH="/usr/local/bin/run_llama_server"
-DEFAULT_BIN="$HOME/llama.cpp/build/bin/llama-server"
 
 # --- 第一阶段: 安装逻辑 ---
 if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
@@ -30,12 +29,24 @@ parse_context_size() {
     fi
 }
 
+# 自动探测 llama-server 程序位置
+find_llama_bin() {
+    if [ -f "/usr/local/bin/llama-server" ]; then
+        echo "/usr/local/bin/llama-server"
+    elif [ -f "$HOME/llama.cpp/build/bin/llama-server" ]; then
+        echo "$HOME/llama.cpp/build/bin/llama-server"
+    else
+        # 默认返回空，由逻辑判断报错
+        echo ""
+    fi
+}
+
 # --- 第三阶段: 参数解析 ---
 
 MODEL_KEYWORD=""
 PORT="8080"
-CTX_INPUT="8192"
-LLAMA_BIN="$DEFAULT_BIN"
+CTX_INPUT="8k"
+USER_BIN=""
 
 # 提取第一个参数作为模型关键字 (如果它不是以 - 开头)
 if [[ -n "$1" && ! "$1" =~ ^- ]]; then
@@ -43,7 +54,7 @@ if [[ -n "$1" && ! "$1" =~ ^- ]]; then
     shift
 fi
 
-# 解析剩余的标志位参数
+# 解析标志位参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p)
@@ -55,11 +66,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --bin)
-            LLAMA_BIN="$2"
+            USER_BIN="$2"
             shift 2
             ;;
         *)
-            # 如果之前没拿到关键字，这里也可以拿
             if [ -z "$MODEL_KEYWORD" ]; then
                 MODEL_KEYWORD="$1"
                 shift
@@ -72,22 +82,34 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MODEL_KEYWORD" ]; then
-    echo "用法: run_llama_server <模型关键字> [-p 端口] [-c 上下文(如 8k)] [--bin 程序路径]"
+    echo "用法: run_llama_server <模型关键字> [-p 端口] [-c 上下文] [--bin 路径]"
     exit 1
 fi
 
+# 确定程序路径
+if [ -n "$USER_BIN" ]; then
+    LLAMA_BIN="$USER_BIN"
+else
+    LLAMA_BIN=$(find_llama_bin)
+fi
+
+# 转换上下文大小
 CTX_SIZE=$(parse_context_size "$CTX_INPUT")
 
 # --- 第四阶段: 核心运行逻辑 ---
 
 # 1. 检查依赖
 if ! command -v ollama_blobs >/dev/null 2>&1; then
-    echo "错误: 未检测到 ollama_blobs。"
+    echo "错误: 未检测到 ollama_blobs 命令。"
     exit 1
 fi
 
-if [ ! -f "$LLAMA_BIN" ]; then
-    echo "错误: 找不到 llama-server 程序: $LLAMA_BIN"
+if [ -z "$LLAMA_BIN" ] || [ ! -f "$LLAMA_BIN" ]; then
+    echo "错误: 找不到 llama-server 程序。"
+    echo "请检查以下位置："
+    echo "1. /usr/local/bin/llama-server"
+    echo "2. $HOME/llama.cpp/build/bin/llama-server"
+    echo "或者使用 --bin 手动指定路径。"
     exit 1
 fi
 
@@ -106,11 +128,13 @@ fi
 
 # 3. 启动
 echo "--------------------------------------------------"
+echo "程序路径: $LLAMA_BIN"
 echo "模型路径: $MODEL_PATH"
-echo "监听端口: $PORT"
-echo "上下文  : $CTX_INPUT -> $CTX_SIZE"
+echo "服务端口: $PORT"
+echo "上下文  : $CTX_INPUT ($CTX_SIZE)"
 echo "--------------------------------------------------"
 
+# 强制环境变量
 export LLAMA_ARG_HOST=0.0.0.0
 
 exec "$LLAMA_BIN" \
