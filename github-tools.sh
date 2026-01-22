@@ -75,7 +75,7 @@ save_metadata() {
     fi
 }
 
-# 安装/更新核心逻辑 (实现三方哈希比对)
+# 安装/更新核心逻辑 (精简输出版)
 do_install() {
     local name=$1
     local url=$2
@@ -84,19 +84,19 @@ do_install() {
     local tmp_file=$(mktemp)
     
     echo "--- 正在处理: $name ---"
+    echo "本地版本时间: $(get_file_mtime "$dest")"
     
-    # 1. 提取本地记录信息 (Version Record)
+    # 1. 提取本地记录信息
     local rec_hash=""
-    local rec_time=""
     if [ -f "$v_file" ]; then
-        IFS=$'\t' read -r rec_time _ rec_hash <<< "$(tail -n 1 "$v_file")"
+        rec_hash=$(tail -n 1 "$v_file" | cut -d$'\t' -f3)
     fi
 
-    # 2. 提取物理文件 Hash (Current File)
+    # 2. 提取物理文件 Hash
     local cur_hash=""
     [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
 
-    # 3. 获取远程文件 Hash (Remote File)
+    # 3. 获取远程文件
     if ! curl -sL "$url" -o "$tmp_file"; then
         echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
     fi
@@ -104,15 +104,13 @@ do_install() {
 
     # --- 逻辑判定矩阵 ---
     if [ "$rem_hash" == "$rec_hash" ]; then
-        # 远程未更新
         if [ "$cur_hash" == "$rec_hash" ]; then
-            echo "没有新版本。 (上次更新时间: $rec_time)"
+            echo "没有新版本。"
         else
             echo "⚠️  远程内容未更新，但本地文件已被外部修改，不作处理。"
         fi
         rm -f "$tmp_file"; return 0
     else
-        # 远程已更新
         if [ -f "$dest" ] && [ "$cur_hash" != "$rec_hash" ]; then
             echo "⚠️  检测到远程更新，但本地文件已被外部修改。"
             read -p "是否使用远程版本覆盖本地修改？(y/n): " confirm
@@ -124,15 +122,11 @@ do_install() {
             echo "检测到新版本。"
         fi
 
-        # 打印旧的时间参考
-        [ -f "$dest" ] && echo "本地版本时间: $(get_file_mtime "$dest")"
-
-        # 执行替换
         if cat "$tmp_file" > "$dest" 2>/dev/null; then
             chmod +x "$dest"
             save_metadata "$name" "$url"
             
-            # 同步文档
+            # 同步 .md 文档
             local doc_url="${url%.sh}.md"
             if curl --output /dev/null --silent --head --fail "$doc_url"; then
                 curl -sL "$doc_url" -o "$META_DIR/$name.md"
@@ -140,13 +134,13 @@ do_install() {
             fi
             echo "✅ 已更新。"
         else
-            echo "❌ 错误: 写入 $dest 失败。"
+            echo "❌ 错误: 无法写入 $dest"
         fi
     fi
     rm -f "$tmp_file"
 }
 
-# 打印帮助信息
+# 打印帮助信息 (略)
 show_help() {
     echo "用法: [sudo] $TOOL_NAME [命令]"
     echo ""
@@ -184,7 +178,7 @@ if [ -z "$1" ]; then
     printf "%-15s %-20s %-10s %-s\n" "---------------" "-------------------" "----------" "----------------"
     if [ -d "$META_DIR" ]; then
         for vfile in "$META_DIR"/*.version; do
-            [ ! -e "$vfile" ] && continue
+            [ ! -e "$vfile" ] && break
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
             IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
