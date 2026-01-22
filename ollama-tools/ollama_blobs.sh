@@ -26,28 +26,18 @@ for arg in "$@"; do
 done
 
 # --- 第三阶段: 路径探测 ---
-
 get_models_dir() {
-    # 1. 优先检查是否有环境变量设置 (手动指定)
-    if [ -n "$OLLAMA_MODELS" ] && [ -d "$OLLAMA_MODELS" ]; then
-        echo "$OLLAMA_MODELS"
-        return
-    fi
-
-    # 2. 尝试从运行中的进程探测
+    # 1. 尝试从运行中的进程探测 (最准确)
     local env_path=$(strings /proc/$(pgrep -x ollama | head -n 1)/environ 2>/dev/null | grep OLLAMA_MODELS | cut -d= -f2)
-    if [ -d "$env_path" ]; then
-        echo "$env_path"
-        return
-    fi
+    if [ -d "$env_path" ]; then echo "$env_path"; return; fi
 
-    # 3. 常见路径硬编码兜底 (针对你的特殊路径)
+    # 2. 硬编码探测 (针对你的自定义存储)
     local common_paths=("/storage/models" "/usr/share/ollama/.ollama/models" "/var/lib/ollama/.ollama/models")
     for p in "${common_paths[@]}"; do
         [ -d "$p/manifests" ] && echo "$p" && return
     done
 
-    # 4. 用户家目录兜底
+    # 3. 用户家目录兜底
     echo "$(getent passwd ${SUDO_USER:-$USER} | cut -d: -f6)/.ollama/models"
 }
 
@@ -55,56 +45,57 @@ MODELS_ROOT=$(get_models_dir)
 MANIFEST_ROOT="$MODELS_ROOT/manifests"
 BLOBS_DIR="$MODELS_ROOT/blobs"
 
-# --- 第四阶段: 核心搜索逻辑 ---
-
-# 预检
 if [ ! -d "$MANIFEST_ROOT" ]; then
-    [ "$ONLY_PATH" = false ] && echo "错误: 无法定位 Manifests 目录 [$MANIFEST_ROOT]"
+    [ "$ONLY_PATH" = false ] && echo "错误: 无法定位模型目录 [$MODELS_ROOT]"
     exit 1
 fi
 
+# --- 第四阶段: 核心搜索逻辑 ---
 results=$( {
-    # 仅在 manifests 目录下递归查找文件
-    find "$MANIFEST_ROOT" -type f | while read -r file; do
-        # 提取模型名称
-        # 处理逻辑：去掉前缀路径，保留 registry/name/tag，并将最后一个 / 换成 :
-        rel_path=${file#$MANIFEST_ROOT/}
-        # 去掉最前面的域名部分 (如 registry.ollama.ai/)
-        model_tag=$(echo "$rel_path" | cut -d/ -f2-)
-        # 统一格式：将最后一个 / 换成 :，去掉 library/
-        model_tag=$(echo "$model_tag" | sed 's/\//:/g' | sed 's/^library://')
+    # 只查找文件，但排除掉内部的 sha256 校验文件夹
+    find "$MANIFEST_ROOT" -type f -not -path "*/manifests/sha256/*" | while read -r file; do
         
-        # 1. 严格检查 model_tag 是否为空
-        [ -z "$model_tag" ] && continue
-
-        # 2. 关键字过滤
-        if [ -n "$KEYWORD" ]; then
-            if [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then
-                continue
-            fi
+        # 解析路径：registry.ollama.ai/library/deepseek-r1/70b
+        # 我们需要提取最后两个部分作为 model:tag
+        rel_path=${file#$MANIFEST_ROOT/}
+        
+        # 使用数组处理路径
+        IFS='/' read -r -a parts <<< "$rel_path"
+        
+        # 正常的 Ollama 结构至少包含 domain/namespace/model/tag (4层)
+        # 或者 domain/model/tag (3层)
+        if [ ${#parts[@]} -ge 3 ]; then
+            tag=${parts[-1]}
+            model=${parts[-2]}
+            model_tag="${model}:${tag}"
+        else
+            continue # 深度不足，说明不是真正的标签文件
         fi
 
-        # 3. 提取 GGUF 权重 Blob (严格匹配 image.model 类型)
-        # 逻辑：在 manifests 文件里找到 image.model 标记，取其紧随其后的 digest
+        # 1. 关键字过滤 (不区分大小写)
+        if [ -n "$KEYWORD" ]; then
+            if [[ ! "${model_tag,,}" =~ "${KEYWORD,,}" ]]; then continue; fi
+        fi
+
+        # 2. 提取 GGUF 权重 Blob (严格匹配 image.model)
         raw_blob=$(grep -A 3 "image.model" "$file" | grep -m 1 -oP '"digest":"\K[^"]+' | sed 's/:/-/g')
 
-        # 4. 只有当 tag 和 blob 同时存在时才输出
-        if [ -n "$model_tag" ] && [ -n "$raw_blob" ]; then
+        if [ -n "$raw_blob" ]; then
             if [ "$ONLY_PATH" = true ]; then
                 echo "$BLOBS_DIR/$raw_blob"
             else
+                # 统一输出格式，去除可能存在的冗余前缀
                 printf "%-50s %-75s\n" "$model_tag" "$raw_blob"
             fi
         fi
     done
 } | sort -u )
 
-# --- 第五阶段: 最终输出 ---
+# --- 第五阶段: 输出 ---
 if [ "$ONLY_PATH" = true ]; then
     [ -n "$results" ] && echo "$results"
 else
     echo "使用模型根目录: $MODELS_ROOT"
-    [ "$EUID" -ne 0 ] && echo "提示: 非 sudo 运行，如果结果不全，请尝试使用 sudo。"
     echo ""
     printf "%-50s %-75s\n" "MODEL TAG" "WEIGHTS BLOB (GGUF)"
     printf "%-50s %-75s\n" "--------------------------------------------------" "---------------------------------------------------------------------------"
