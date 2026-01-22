@@ -12,7 +12,6 @@
 TOOL_NAME="github-tools"
 DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
-# 元数据及文档存放至 share 目录
 META_DIR="/usr/local/share/github-tools-meta"
 
 # 确保元数据目录存在
@@ -35,11 +34,40 @@ show_doc() {
         cat "$doc_file"
         echo "--- 文档内容结束 ---"
     fi
-    echo "" # 结尾空行
+    echo ""
     exit 0
 }
 
-# 追溯进程树捕获下载 URL
+# 获取文件修改时间
+get_file_mtime() {
+    local file=$1
+    if [ -f "$file" ]; then
+        date -r "$file" "+%Y-%m-%d %H:%M:%S"
+    else
+        echo "不存在"
+    fi
+}
+
+# 下载并同步服务器时间
+download_with_mtime() {
+    local url=$1
+    local dest=$2
+    local tmp_header=$(mktemp)
+    
+    if curl -sL -D "$tmp_header" "$url" -o "$dest"; then
+        # 提取 Last-Modified 并应用
+        local remote_time=$(grep -i "last-modified:" "$tmp_header" | cut -d' ' -f2-)
+        if [ -n "$remote_time" ]; then
+            touch -d "$remote_time" "$dest"
+        fi
+        rm -f "$tmp_header"
+        return 0
+    fi
+    rm -f "$tmp_header"
+    return 1
+}
+
+# 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
 get_download_url() {
     local pid=$$
     for i in {1..10}; do
@@ -53,7 +81,7 @@ get_download_url() {
     done
 }
 
-# 记录版本信息 (记录时间、原始 URL 和 SHA256 哈希)
+# 记录版本信息
 save_metadata() {
     local name=$1
     local url=$2
@@ -61,65 +89,45 @@ save_metadata() {
     local m_hash=$(sha256sum "$DEST_DIR/$name" 2>/dev/null | cut -d' ' -f1)
     
     [ -z "$m_hash" ] && return 1
-    # 尝试写入，若权限不足则返回失败
     if ! printf "%s\t%s\t%s\n" "$(date '+%Y-%m-%d/%H:%M:%S')" "$url" "$m_hash" >> "$v_file" 2>/dev/null; then
         return 1
     fi
 }
 
-# 同步文档逻辑 (探测并下载同名 .md 文件)
-sync_document() {
-    local name=$1
-    local url=$2
-    local doc_url="${url%.sh}.md"
-    local doc_dest="$META_DIR/$name.md"
-
-    # 只有当远程存在 .md 时才下载
-    if curl --output /dev/null --silent --head --fail "$doc_url"; then
-        if curl -sL "$doc_url" -o "$doc_dest"; then
-            echo "[$name] 说明文档已同步。"
-        fi
-    fi
-}
-
-# 安装/下载核心逻辑 (带执行状态捕获)
+# 安装/更新核心逻辑 (修复了误执行问题并加入时间同步)
 do_install() {
     local name=$1
     local url=$2
+    local dest="$DEST_DIR/$name"
     local tmp_file=$(mktemp)
-    local status=0
     
+    local old_time=$(get_file_mtime "$dest")
     echo "--- 正在处理: $name ---"
-    if curl -sL "$url" -o "$tmp_file"; then
-        if [ "$name" == "$TOOL_NAME" ]; then
-            # 针对自身的权限捕获
-            if ! { cat "$tmp_file" > "$DEST_PATH" 2>/dev/null && chmod +x "$DEST_PATH" 2>/dev/null; }; then
-                echo "错误: 无法写入 $DEST_PATH，请使用 sudo 运行。"
-                status=1
-            fi
-        else
-            # 执行子脚本自身的安装逻辑，并捕获其返回码
-            if ! bash "$tmp_file"; then
-                status=1
-            fi
-        fi
+    echo "本地版本时间: $old_time"
 
-        # 只有在物理安装成功后，才更新元数据记录和同步文档
-        if [ $status -eq 0 ]; then
-            if save_metadata "$name" "$url"; then
-                sync_document "$name" "$url"
-                echo "[$name] 成功完成。"
-            else
-                echo "错误: 无法保存 [$name] 的版本记录，请使用 sudo 运行。"
-                status=1
+    if download_with_mtime "$url" "$tmp_file"; then
+        local new_time=$(get_file_mtime "$tmp_file")
+        echo "远程版本时间: $new_time"
+
+        if cat "$tmp_file" > "$dest" 2>/dev/null; then
+            chmod +x "$dest"
+            touch -r "$tmp_file" "$dest"
+            save_metadata "$name" "$url"
+            
+            # 同步 .md 文档
+            local doc_url="${url%.sh}.md"
+            if curl --output /dev/null --silent --head --fail "$doc_url"; then
+                download_with_mtime "$doc_url" "$META_DIR/$name.md"
+                echo "[$name] 说明文档已同步。"
             fi
+            echo "✅ [$name] 更新成功。"
+        else
+            echo "❌ 错误: 写入 $dest 失败。"
         fi
     else
-        echo "错误: 下载失败 $url"
-        status=1
+        echo "❌ 错误: 下载失败 $url"
     fi
     rm -f "$tmp_file"
-    return $status
 }
 
 # 打印帮助信息
@@ -127,41 +135,34 @@ show_help() {
     echo "用法: [sudo] $TOOL_NAME [命令]"
     echo ""
     echo "命令:"
-    echo "  (无参数)             列出所有已安装工具、版本及文档状态"
-    echo "  help, -v             显示此帮助信息"
-    echo "  sudo $TOOL_NAME add <URL>      安装新脚本。如果工具名已存在，则视为更新"
-    echo "  sudo $TOOL_NAME update         更新所有已记录的工具 (自动同步文档，最后更新自身)"
-    echo "  sudo $TOOL_NAME update <名称>  指定更新某个工具 (使用最后记录的 URL)"
+    echo "  (无参数)             列出所有已安装工具及文档状态"
+    echo "  help, -v             显示帮助信息"
+    echo "  -doc                 查阅 github-tools 自身说明文档"
+    echo "  sudo $TOOL_NAME add <URL>      安装脚本并同步文档"
+    echo "  sudo $TOOL_NAME update         更新全部工具"
+    echo "  sudo $TOOL_NAME update <名称>  更新指定工具"
 }
 
-# --- 检查 -doc 参数 ---
+# 拦截 -doc 参数
 for arg in "$@"; do
     if [ "$arg" == "-doc" ]; then show_doc; fi
 done
 
-# --- 第一阶段: 管道自安装 (检测当前是否处于管道执行状态) ---
+# --- 第一阶段: 管道自安装 ---
 if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
     if [ "$EUID" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
     URL=$(get_download_url)
-    if [ -n "$URL" ]; then
-        do_install "$TOOL_NAME" "$URL"
-    else
-        echo "无法自动确定来源，请通过 'sudo $TOOL_NAME add <URL>' 注册自身"
-    fi
-    echo ""
-    exit 0
+    if [ -n "$URL" ]; then do_install "$TOOL_NAME" "$URL"
+    else echo "无法确定来源，请通过 'sudo $TOOL_NAME add <URL>' 注册自身"; fi
+    echo ""; exit 0
 fi
 
 # --- 第二阶段: 管理逻辑 ---
 
-# 1. 帮助
 if [ "$1" == "help" ] || [ "$1" == "-v" ]; then
-    show_help
-    echo ""
-    exit 0
+    show_help; echo ""; exit 0
 fi
 
-# 2. 无参数: 查询列表
 if [ -z "$1" ]; then
     printf "%-15s %-20s %-10s %-s\n" "工具名称" "最近更新" "文档" "HASH(部分)"
     printf "%-15s %-20s %-10s %-s\n" "---------------" "-------------------" "----------" "----------------"
@@ -170,80 +171,45 @@ if [ -z "$1" ]; then
             [ ! -e "$vfile" ] && break
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
-            IFS=$'\t' read -r m_time m_url m_hash <<< "$LAST_LINE"
-            
-            # 检查本地是否有 .md 文档
-            DOC_STAT="×"
-            [ -f "$META_DIR/$T_NAME.md" ] && DOC_STAT="√"
-            
-            if [[ ! "$m_url" =~ ^http ]]; then
-                printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "损坏" "$DOC_STAT" "N/A"
-            else
-                printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "${m_hash:0:12}..."
-            fi
+            IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
+            DOC_STAT="×"; [ -f "$META_DIR/$T_NAME.md" ] && DOC_STAT="√"
+            printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "${T_HASH:0:12}..."
         done
     fi
-    echo ""
-    exit 0
+    echo ""; exit 0
 fi
 
-# 3. add <URL>
 if [ "$1" == "add" ]; then
     if [[ "$2" =~ ^http ]]; then
-        NAME=$(basename "$2" .sh)
-        do_install "$NAME" "$2"
-    else
-        echo "错误: add 命令需要提供有效的 URL。"
-        show_help; exit 1
-    fi
-    echo ""
-    exit 0
+        NAME=$(basename "$2" .sh); do_install "$NAME" "$2"
+    else echo "错误: 需要有效 URL。"; fi
+    echo ""; exit 0
 fi
 
-# 4. update
 if [ "$1" == "update" ]; then
     if [ -n "$2" ]; then
-        # 更新指定工具
         VFILE="$META_DIR/$2.version"
         if [ -f "$VFILE" ]; then
-            URL=$(tail -n 1 "$VFILE" | awk -F'\t' '{print $2}')
-            do_install "$2" "$URL"
-        else
-            echo "错误: 未找到工具 [$2] 的版本记录。"
-            exit 1
+            URL=$(tail -n 1 "$VFILE" | awk -F'\t' '{print $2}'); do_install "$2" "$URL"
         fi
     else
-        echo "--- 检查全部更新 ---"
         SELF_URL=""
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
             IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
-            [[ ! "$T_URL" =~ ^http ]] && continue
             if [ "$T_NAME" == "$TOOL_NAME" ]; then SELF_URL="$T_URL"; continue; fi
             REMOTE_H=$(curl -sL "$T_URL" | sha256sum | cut -d' ' -f1)
-            if [ "$REMOTE_H" != "$T_HASH" ]; then
-                do_install "$T_NAME" "$T_URL"
-            else
-                echo "[$T_NAME] 已是最新。"
-            fi
+            [ "$REMOTE_H" != "$T_HASH" ] && do_install "$T_NAME" "$T_URL" || echo "[$T_NAME] 已是最新。"
         done
-        
-        # 最后执行自更新
         if [ -n "$SELF_URL" ]; then
-            read -r CUR_H _ < <(sha256sum "$DEST_PATH")
             REMOTE_H=$(curl -sL "$SELF_URL" | sha256sum | cut -d' ' -f1)
+            CUR_H=$(sha256sum "$DEST_PATH" | cut -d' ' -f1)
             [ "$REMOTE_H" != "$CUR_H" ] && do_install "$TOOL_NAME" "$SELF_URL" || echo "[$TOOL_NAME] 已是最新。"
         fi
     fi
-    echo ""
-    exit 0
+    echo ""; exit 0
 fi
 
-# 5. 未知参数处理
-echo "未知参数: $1"
-echo "----------------"
-show_help
 echo ""
-exit 1
