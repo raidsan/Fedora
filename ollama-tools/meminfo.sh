@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # 名称: meminfo
-# 用途: 深度监控 GPU 资源。集成 [驱动/KFD内核/多节点映射] 三级探测。
+# 用途: 深度监控 GPU 资源。修复了 Maps 扫描时的 awk 语法错误。
 # ==============================================================================
 
 if [ "$EUID" -ne 0 ]; then
@@ -14,6 +14,7 @@ VERBOSE=false
 [[ "$1" == "-verbose" || "$1" == "--verbose" ]] && VERBOSE=true
 
 format_gb() {
+    # 简单的 GB 格式化输出
     echo "scale=2; $1 / 1048576" | bc | awk '{printf "%.2f GB", $0}'
 }
 
@@ -69,32 +70,38 @@ else
         if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
             kfd_path="/sys/class/kfd/kfd/proc/$pid/mem_bank"
             if [ -d "$kfd_path" ]; then
-                # 尝试读取 used_bytes，如果为 0，在 verbose 模式下检查 properties
                 kfd_val=$(cat $kfd_path/*/used_bytes 2>/dev/null | awk '{s+=$1} END {print (s?s:0)}')
-                [ "$VERBOSE" = true ] && echo "[DEBUG] KFD used_bytes: $kfd_val"
                 [[ "$kfd_val" -gt 0 ]] && vram_bytes=$kfd_val
             fi
         fi
 
-        # 3. Maps 扩展扫描 (同时匹配 kfd 和 render 节点)
-        if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 || "$vram_bytes" -lt 1000000 ]]; then
+        # 3. Maps 扩展扫描 (使用纯 awk 16进制转换，不调用外部 bc)
+        if [[ -z "$vram_bytes" || "$vram_bytes" -eq 0 ]]; then
             maps_data=$(grep -E "dev/kfd|dev/dri/render|amdgpu" /proc/$pid/maps 2>/dev/null)
             if [ -n "$maps_data" ]; then
-                [ "$VERBOSE" = true ] && echo "[DEBUG] 命中映射段，执行 16 进制累加计算..."
-                maps_bytes=$(echo "$maps_data" | awk -F'[- ]' '{
-                    cmd = "echo \"obase=10; ibase=16; \" toupper($2) \"-\" toupper($1) | bc";
-                    cmd | getline diff;
-                    close(cmd);
-                    sum += diff;
-                } END {print (sum?sum:0)}')
-                # 如果 Maps 算出来的比之前的大，则采用 Maps
-                [[ "$maps_bytes" -gt "$vram_bytes" ]] && vram_bytes=$maps_bytes
+                [ "$VERBOSE" = true ] && echo "[DEBUG] 命中映射段，执行内部转换..."
+                maps_bytes=$(echo "$maps_data" | awk -F'[- ]' '
+                    function hex2dec(h,   i, v, len, c) {
+                        v = 0; len = length(h);
+                        for (i = 1; i <= len; i++) {
+                            c = tolower(substr(h, i, 1));
+                            v = v * 16 + (index("0123456789abcdef", c) - 1);
+                        }
+                        return v;
+                    }
+                    {
+                        sum += (hex2dec($2) - hex2dec($1));
+                    }
+                    END { printf "%0.f", sum }
+                ')
+                [[ "$maps_bytes" -gt 0 ]] && vram_bytes=$maps_bytes
             fi
         fi
 
         v_display=$(format_gb $((vram_bytes / 1024)))
         g_display=$(format_gb $((gtt_bytes / 1024)))
 
+        # 兜底：如果还是 0 但明确有设备文件占用
         if [[ "$v_display" == "0.00 GB" ]]; then
             if ls -l /proc/$pid/fd 2>/dev/null | grep -qE "render|kfd"; then
                 v_display="[锁定显存]"
@@ -113,6 +120,8 @@ sys_free_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
 printf "%-20s %s\n" "Ram Total:" "$(format_gb $sys_total_kb)"
 printf "%-20s %s\n" "Free Ram Total:" "$(format_gb $sys_free_kb)"
 
-[ "$active_flag" = true ] && echo -e "\n\033[33m注: 部分进程显存由驱动底层锁定，数值仅供参考。\033[0m"
+if [ "$active_flag" = true ]; then
+    echo -e "\n\033[33m注: [锁定显存] 表示驱动上报为0，数值尝试从 KFD/Maps 提取未果。\033[0m"
+fi
 
 echo ""
