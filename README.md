@@ -10,7 +10,7 @@ export TOOLS_URL=$MAIN/github-tools.sh
 curl -sL $TOOLS_URL | sudo bash -s -- $TOOLS_URL  
 
 ## for ollama  
-github-tools add $MAIN/ollama-tools/ollama_pull.sh  
-github-tools add $MAIN/ollama-tools/ollama_list.sh  
-github-tools add $MAIN/ollama-tools/ollama_rm.sh  
-github-tools add $MAIN/ollama-tools/ollama_blobs.sh  
+sudo github-tools add $MAIN/ollama-tools/ollama_pull.sh  
+sudo github-tools add $MAIN/ollama-tools/ollama_list.sh  
+sudo github-tools add $MAIN/ollama-tools/ollama_rm.sh  
+sudo github-tools add $MAIN/ollama-tools/ollama_blobs.sh  
