@@ -1,24 +1,53 @@
 #!/bin/bash
 
-# --- 1. 安装逻辑 ---
-INSTALL_DIR="$HOME/bin"
-SCRIPT_NAME="ollama_pull"
-TARGET_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+# ==============================================================================
+# 名称: ollama_pull
+# 用途: 快速拉取 Ollama 模型，支持多镜像源切换及断点续传。
+# 管理: 由 github-tools 管理，安装于 /usr/local/bin/
+# 文档: 支持 -doc 参数查看
+# ==============================================================================
 
-install_logic() {
-    mkdir -p "$INSTALL_DIR"
-    
-    cat << 'INNER_EOF' > "$TARGET_PATH"
-#!/bin/bash
-# 设置基础环境路径
-export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+TOOL_NAME="ollama_pull"
+DEST_PATH="/usr/local/bin/$TOOL_NAME"
+META_DIR="/usr/local/share/github-tools-meta"
 
-# --- 变量初始化 ---
+# --- 第一阶段: 安装逻辑 (适配 github-tools) ---
+if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
+    if [ "$EUID" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
+    cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
+    echo "$TOOL_NAME 已成功安装至 $DEST_PATH。"
+    exit 0
+fi
+
+# --- 第二阶段: 文档查阅逻辑 ---
+show_doc() {
+    local doc_file="$META_DIR/$TOOL_NAME.md"
+    if [ ! -f "$doc_file" ]; then
+        echo "错误: 未找到对应的文档文件 ($doc_file)。"
+        exit 1
+    fi
+    # 优先使用 glow 渲染，否则回退至 cat
+    if command -v glow >/dev/null 2>&1; then
+        glow "$doc_file"
+    else
+        echo -e "\n--- $TOOL_NAME 使用文档 ---\n"
+        cat "$doc_file"
+        echo -e "\n--- 文档结束 ---\n"
+    fi
+    exit 0
+}
+
+# 检查是否请求查看文档
+[[ "$1" == "-doc" ]] && show_doc
+
+# --- 第三阶段: 业务逻辑 ---
+
+# 变量初始化
 MODELS=()
 MIRROR_NAME="dao" 
 MIRROR_PREFIX="ollama.m.daocloud.io/library/" 
 
-# --- 参数解析 ---
+# 参数解析
 for arg in "$@"; do
     case $arg in
         --p=nju|-p=nju)
@@ -30,7 +59,7 @@ for arg in "$@"; do
             MIRROR_NAME="dao"
             ;;
         -p=*|--p=*)
-            echo "Error: Unsupported mirror provider: $arg"
+            echo "错误: 不支持的镜像提供商: $arg"
             exit 1
             ;;
         *)
@@ -40,85 +69,35 @@ for arg in "$@"; do
 done
 
 if [ ${#MODELS[@]} -eq 0 ]; then
-    echo "Usage: ollama_pull <model1> <url2> ... [-p=dao|nju]"
+    echo "使用方法: $TOOL_NAME <模型1> <模型2...> [-p=nju|dao]"
+    echo "提示: 输入 '$TOOL_NAME -doc' 查看详细手册。"
     exit 1
 fi
 
-trap 'echo -e "\n🛑 User interrupted. Exiting..."; exit 1' SIGINT SIGTERM
+echo "----------------------------------------------------"
+echo "🛠️  镜像源: $MIRROR_NAME ($MIRROR_PREFIX)"
+echo "----------------------------------------------------"
 
-# --- 批量处理循环 ---
-for INPUT in "${MODELS[@]}"; do
-    echo "----------------------------------------------------"
+for model in "${MODELS[@]}"; do
+    SHORT_NAME=$(echo "$model" | awk -F'/' '{print $3}' | awk -F'@' '{print $1}')
+    [ -z "$SHORT_NAME" ] && SHORT_NAME=$(echo "$model" | awk -F'/' '{print $NF}')
     
-    # 路径与镜像一致性校验
-    if [[ "$INPUT" == *"/"* ]]; then
-        if [[ "$INPUT" != "$MIRROR_PREFIX"* ]]; then
-            echo "Conflict Error!"
-            echo "Input URL : $INPUT"
-            echo "Expected  : $MIRROR_PREFIX (based on -p=$MIRROR_NAME)"
-            exit 1
-        fi
-        FULL_URL="$INPUT"
-        SHORT_NAME="${INPUT##*/}"
-    else
-        FULL_URL="${MIRROR_PREFIX}${INPUT}"
-        SHORT_NAME="$INPUT"
-    fi
-
-    # --- 预检逻辑 ---
-    # 使用 ollama show 尝试获取远程信息来验证模型是否存在
-    echo "🔍 Validating model existence: $FULL_URL"
-    if ! ollama show "$FULL_URL" > /dev/null 2>&1; then
-        # 如果 show 失败，尝试 pull 一下 manifest 级别（轻量级验证）
-        if ! timeout 10s ollama pull "$FULL_URL" 2>&1 | grep -q "pulling manifest"; then
-             echo "✅ Pre-check: Model manifests confirmed or ready for pull."
-        fi
-    fi
-
-    echo "🚀 Model  : $SHORT_NAME"
-    echo "🌐 Source : $FULL_URL"
+    FULL_URL="$MIRROR_PREFIX$model"
     
-    # 进入重试循环
+    echo "🚀 正在拉取: $SHORT_NAME"
+    
     while true; do
-        echo "🔄 Pulling data (Resume supported)..."
         if ollama pull "$FULL_URL"; then
-            echo "✅ Pull success. Creating alias..."
-            # 创建简称别名
-            if ollama cp "$FULL_URL" "$SHORT_NAME"; then
-                echo "✨ Alias '$SHORT_NAME' is ready."
-                echo "ℹ️  Original tag '$FULL_URL' is kept."
-            fi
+            echo "✅ 拉取成功，创建别名..."
+            ollama cp "$FULL_URL" "$SHORT_NAME"
+            echo "✨ 别名 '$SHORT_NAME' 已就绪。"
             break
         else
-            echo "⚠️  Connection failed. Retrying in 5s (Ctrl+C to stop)..."
+            echo "⚠️  连接失败，5秒后自动重试 (Ctrl+C 退出)..."
             sleep 5
         fi
     done
 done
 
 echo "----------------------------------------------------"
-echo "🎉 All tasks completed!"
-INNER_EOF
-
-    # 赋予执行权限
-    chmod +x "$TARGET_PATH"
-    echo "✅ Ollama Pull Tool updated at $TARGET_PATH"
-
-    # --- 2. 环境变量 PATH 管理 ---
-    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        SHELL_RC="$HOME/.bashrc"
-        [[ "$SHELL" == *"zsh"* ]] && SHELL_RC="$HOME/.zshrc"
-        if ! grep -q "$INSTALL_DIR" "$SHELL_RC"; then
-            echo -e "\n# Path for custom ollama tools\nexport PATH=\"\$HOME/bin:\$PATH\"" >> "$SHELL_RC"
-            echo "📝 PATH added to $SHELL_RC"
-        fi
-    fi
-}
-
-# 执行安装
-install_logic
-
-# --- 3. 参数穿透执行 ---
-if [ $# -gt 0 ]; then
-    "$TARGET_PATH" "$@"
-fi
+echo "🎉 所有任务执行完毕！"
