@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# 功能: github-tools 脚本管理器
+# 功能: github-tools 脚本管理器 (兼容 Fedora/OpenWrt)
 # 1. 帮助: sudo github-tools help / -v
 # 2. 列出: github-tools (不带参数)
-# 3. 新增: sudo github-tools add <URL> - 安装新脚本并同步 .md 文档
+# 3. 新增: sudo github-tools add <URL 或 相对路径>
+#    - 支持相对路径: github-tools add linux-tools/ssh_tmux.sh
+#    - 逻辑: 以 github-tools 自身下载源为根目录进行拼接
 # 4. 更新: sudo github-tools update - 全部更新 (自动检测 HASH 变动并同步文档)
 # 5. 文档: 工具存储于 /usr/local/share/github-tools-meta/，支持工具带 -doc 参数查阅
 # ==============================================================================
@@ -36,6 +38,31 @@ show_doc() {
     fi
     echo ""
     exit 0
+}
+
+# 获取自身根 URL (用于拼接相对路径)
+get_base_url() {
+    local v_file="$META_DIR/$TOOL_NAME.version"
+    if [ -f "$v_file" ]; then
+        local full_url=$(tail -n 1 "$v_file" | cut -d$'\t' -f2)
+        echo "${full_url%/*}" # 返回去掉文件名的部分
+    fi
+}
+
+# 解析输入参数 (URL or Path)
+resolve_url() {
+    local input=$1
+    if [[ "$input" =~ ^http ]]; then
+        echo "$input"
+    else
+        local base=$(get_base_url)
+        if [ -z "$base" ]; then
+            echo "错误: 无法获取根路径，请先使用完整 URL 安装 $TOOL_NAME" >&2
+            exit 1
+        fi
+        # 处理可能存在的目录层级
+        echo "$base/${input#*/}"
+    fi
 }
 
 # 获取本地文件修改时间
@@ -156,7 +183,7 @@ show_help() {
     echo "  (无参数)             列出所有已安装工具及文档状态"
     echo "  help, -v             显示帮助信息"
     echo "  -doc                 查阅 github-tools 自身说明文档"
-    echo "  sudo $TOOL_NAME add <URL>      安装脚本并同步文档"
+    echo "  sudo $TOOL_NAME add <URL 或 相对路径>      安装脚本并同步文档"
     echo "  sudo $TOOL_NAME update         更新全部工具"
     echo "  sudo $TOOL_NAME update <名称>  更新指定工具"
 }
@@ -198,9 +225,11 @@ if [ -z "$1" ]; then
 fi
 
 if [ "$1" == "add" ]; then
-    if [[ "$2" =~ ^http ]]; then
-        NAME=$(basename "$2" .sh); do_install "$NAME" "$2"
-    else echo "错误: 需要有效 URL。"; fi
+    if [ -n "$2" ]; then
+        FINAL_URL=$(resolve_url "$2")
+        NAME=$(basename "$FINAL_URL" .sh)
+        do_install "$NAME" "$FINAL_URL"
+    fi
     echo ""; exit 0
 fi
 
