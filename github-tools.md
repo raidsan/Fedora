@@ -35,7 +35,7 @@ export MAIN=$GITHUB/raidsan/Fedora/refs/heads/main
 export TOOLS_URL=$MAIN/github-tools.sh
 
 # 4. 一键安装并自注册 (通过 bash -s 传递参数)
-curl -sL $TOOLS_URL | sudo bash -s -- $TOOLS_URL
+curl -sL $TOOLS_URL | <sudo> bash -s -- $TOOLS_URL
 ```
 
 ### 2.2 帮助与版本信息
@@ -105,3 +105,6 @@ netinfo -doc
 * **损坏修复**：若 .version 文件内容不符合预期（如非 Tab 分隔或 URL 格式错误），列表将提示 损坏。此时只需运行 add <URL> 重新安装即可重建。
 * **输出偏好**：脚本所有指令执行完毕后，会额外输出一个空行，确保输出内容与下一个命令提示符（Prompt）之间有清晰的视觉间隔，方便分析。
 * **权限说明**：涉及安装、更新、写入元数据目录的操作必须使用 sudo。
+
+### 3.6 脚本适配了 ash 语法和root运行环境
+openwrt使用的ash 语法不支持 ==， d$'\t'

@@ -54,7 +54,7 @@ show_doc() {
 get_base_url() {
     local v_file="$META_DIR/$TOOL_NAME.version"
     if [ -f "$v_file" ]; then
-        local full_url=$(tail -n 1 "$v_file" | cut -d$'\t' -f2)
+        local full_url=$(tail -n 1 "$v_file" | cut -d'	' -f2)
         echo "${full_url%/*}" # 返回去掉文件名的部分
     fi
 }
@@ -62,17 +62,18 @@ get_base_url() {
 # 解析输入参数 (URL or Path)
 resolve_url() {
     local input=$1
-    if [[ "$input" =~ ^http ]]; then
-        echo "$input"
-    else
-        local base=$(get_base_url)
-        if [ -z "$base" ]; then
-            echo "错误: 无法获取根路径，请先使用完整 URL 安装 $TOOL_NAME" >&2
-            exit 1
-        fi
-        # 处理可能存在的目录层级
-        echo "$base/${input#*/}"
-    fi
+    # 兼容 ash 的字符串匹配
+    case "$input" in
+        http*) echo "$input" ;;
+        *)
+            local base=$(get_base_url)
+            if [ -z "$base" ]; then
+                echo "错误: 无法获取根路径，请先使用完整 URL 安装 $TOOL_NAME" >&2
+                exit 1
+            fi
+            echo "$base/${input#*/}"
+            ;;
+    esac
 }
 
 # 获取本地文件修改时间
@@ -87,15 +88,14 @@ get_file_mtime() {
 
 # 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
 get_download_url() {
-    # 优先从命令行参数获取 (针对 bash -s -- URL)
-    if [[ "$1" =~ ^http ]]; then
-        echo "$1"
-        return
-    fi
+    # 优先从命令行参数获取 (针对 (b)ash -s -- URL)
+    case "$1" in
+        http*) echo "$1"; return ;;
+    esac
     
     # 备选：从进程树捕获
     local pid=$$
-    for i in {1..5}; do
+    for i in 1 2 3 4 5; do
         local ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
         [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
         # OpenWrt cat /proc/pid/cmdline 可能因 busybox 限制不可用，增加 grep 检查
@@ -114,9 +114,8 @@ save_metadata() {
     local m_hash=$(sha256sum "$DEST_DIR/$name" 2>/dev/null | cut -d' ' -f1)
     
     [ -z "$m_hash" ] && return 1
-    if ! printf "%s\t%s\t%s\n" "$(date '+%Y-%m-%d/%H:%M:%S')" "$url" "$m_hash" >> "$v_file" 2>/dev/null; then
-        return 1
-    fi
+    # 使用标准制表符写入
+    printf "%s\t%s\t%s\n" "$(date '+%Y-%m-%d/%H:%M:%S')" "$url" "$m_hash" >> "$v_file" 2>/dev/null
 }
 
 # 无缓存下载核心 (注入时间戳与请求头屏蔽 GitHub 缓存)
@@ -124,7 +123,8 @@ curl_no_cache() {
     local url=$1
     local out=$2
     local sep="?"
-    [[ "$url" == *\?* ]] && sep="&"
+    # 检查 URL 是否已包含问号
+    echo "$url" | grep -q '?' && sep="&"
     local fresh_url="${url}${sep}t=$(date +%s%N)"
     
     curl -sL -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
@@ -144,7 +144,7 @@ do_install() {
     # 1. 提取本地记录信息
     local rec_hash=""
     if [ -f "$v_file" ]; then
-        rec_hash=$(tail -n 1 "$v_file" | cut -d$'\t' -f3)
+        rec_hash=$(tail -n 1 "$v_file" | cut -d'	' -f3)
     fi
 
     # 2. 提取物理文件 Hash
@@ -158,8 +158,8 @@ do_install() {
     local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
 
     # --- 逻辑判定矩阵 ---
-    if [ "$rem_hash" == "$rec_hash" ]; then
-        if [ "$cur_hash" == "$rec_hash" ]; then
+    if [ "$rem_hash" = "$rec_hash" ]; then
+        if [ "$cur_hash" = "$rec_hash" ]; then
             echo "没有新版本。"
         else
             echo "⚠️  远程内容未更新，但本地文件已被外部修改，不作处理。"
@@ -168,11 +168,12 @@ do_install() {
     else
         if [ -f "$dest" ] && [ "$cur_hash" != "$rec_hash" ]; then
             echo "⚠️  检测到远程更新，但本地文件已被外部修改。"
-            read -p "是否使用远程版本覆盖本地修改？(y/n): " confirm
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                echo "操作已取消。"
-                rm -f "$tmp_file"; return 0
-            fi
+            printf "是否使用远程版本覆盖本地修改？(y/n): "
+            read confirm
+            case "$confirm" in
+                [Yy]*) ;;
+                *) echo "操作已取消。"; rm -f "$tmp_file"; return 0 ;;
+            esac
         else
             echo "检测到新版本。"
         fi
@@ -207,17 +208,24 @@ show_help() {
 
 # 拦截 -doc 参数
 for arg in "$@"; do
-    if [ "$arg" == "-doc" ]; then show_doc; fi
+    if [ "$arg" = "-doc" ]; then show_doc; fi
 done
 
 # --- 第一阶段: 自注册/安装逻辑优化 ---
-# 判断条件：如果当前运行的文件名不是目标路径，或者是从管道/临时目录运行的
-if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ]; then
-    # 获取下载 URL (尝试从第一个参数 $1 获取，那是 bash -s 传进来的)
+CURRENT_REALPATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+IS_PIPE=0
+# 使用更兼容的模式匹配检查运行环境
+if [ ! -f "$0" ]; then
+    IS_PIPE=1
+else
+    case "$0" in
+        *bash*|*sh*|/tmp/*) IS_PIPE=1 ;;
+    esac
+fi
+
+if [ "$CURRENT_REALPATH" != "$DEST_PATH" ] || [ "$IS_PIPE" -eq 1 ]; then
     URL=$(get_download_url "$1")
-    
     if [ -n "$URL" ]; then
-        # 这里的 do_install 需要调用者具备权限
         do_install "$TOOL_NAME" "$URL"
     else
         echo "无法确定来源。建议手动注册:"
@@ -229,7 +237,7 @@ fi
 
 # --- 第二阶段: 管理逻辑 ---
 
-if [ "$1" == "help" ] || [ "$1" == "-v" ]; then
+if [ "$1" = "help" ] || [ "$1" = "-v" ]; then
     show_help; echo ""; exit 0
 fi
 
@@ -241,15 +249,18 @@ if [ -z "$1" ]; then
             [ ! -e "$vfile" ] && break
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
-            IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
+            # 兼容 ash 的 IFS 读取
+            m_time=$(echo "$LAST_LINE" | cut -d'	' -f1)
+            T_URL=$(echo "$LAST_LINE" | cut -d'	' -f2)
+            T_HASH=$(echo "$LAST_LINE" | cut -d'	' -f3)
             DOC_STAT="×"; [ -f "$META_DIR/$T_NAME.md" ] && DOC_STAT="√"
-            printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "${T_HASH:0:12}..."
+            printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "$(echo $T_HASH | cut -c1-12)..."
         done
     fi
     echo ""; exit 0
 fi
 
-if [ "$1" == "add" ]; then
+if [ "$1" = "add" ]; then
     if [ -n "$2" ]; then
         FINAL_URL=$(resolve_url "$2")
         NAME=$(basename "$FINAL_URL" .sh)
@@ -258,11 +269,11 @@ if [ "$1" == "add" ]; then
     echo ""; exit 0
 fi
 
-if [ "$1" == "update" ]; then
+if [ "$1" = "update" ]; then
     if [ -n "$2" ]; then
         VFILE="$META_DIR/$2.version"
         if [ -f "$VFILE" ]; then
-            URL=$(tail -n 1 "$VFILE" | awk -F'\t' '{print $2}')
+            URL=$(tail -n 1 "$VFILE" | cut -d'	' -f2)
             do_install "$2" "$URL"
         fi
     else
@@ -270,9 +281,11 @@ if [ "$1" == "update" ]; then
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
-            LAST_LINE=$(tail -n 1 "$vfile")
-            IFS=$'\t' read -r m_time T_URL T_HASH <<< "$LAST_LINE"
-            [ "$T_NAME" == "$TOOL_NAME" ] && { SELF_URL="$T_URL"; continue; }
+            T_URL=$(tail -n 1 "$vfile" | cut -d'	' -f2)
+            if [ "$T_NAME" = "$TOOL_NAME" ]; then
+                SELF_URL="$T_URL"
+                continue
+            fi
             do_install "$T_NAME" "$T_URL"
         done
         [ -n "$SELF_URL" ] && do_install "$TOOL_NAME" "$SELF_URL"
