@@ -15,7 +15,8 @@ DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
 META_DIR="/usr/local/share/github-tools-meta"
 
-# 确保元数据目录存在
+# 确保目录存在
+[ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR" 2>/dev/null
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
 # 检测是否需要使用 sudo (OpenWrt root 用户不强制要求)
