@@ -2,13 +2,12 @@
 
 # ==============================================================================
 # 功能: github-tools 脚本管理器 (兼容 Fedora/OpenWrt)
-# 1. 帮助: sudo github-tools help / -v
+# 1. 帮助: github-tools help / -v  /-doc 查阅md文档
 # 2. 列出: github-tools (不带参数)
-# 3. 新增: sudo github-tools add <URL 或 相对路径>
-#    - 支持相对路径: github-tools add linux-tools/ssh_tmux.sh
-#    - 逻辑: 以 github-tools 自身下载源为根目录进行拼接
-# 4. 更新: sudo github-tools update - 全部更新 (自动检测 HASH 变动并同步文档)
-# 5. 文档: 工具存储于 /usr/local/share/github-tools-meta/，支持工具带 -doc 参数查阅
+# 3. 新增: <sudo> github-tools add <URL 或 相对路径>
+# 4. 更新: <sudo> github-tools update - 全部更新 (自动检测 HASH 变动并同步文档)
+# 依赖: curl, sha256sum, grep, awk, ps
+# 管理: /usr/local/share/github-tools-meta/
 # ==============================================================================
 
 TOOL_NAME="github-tools"
@@ -19,7 +18,18 @@ META_DIR="/usr/local/share/github-tools-meta"
 # 确保元数据目录存在
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# --- 新增：文档查阅逻辑 ---
+# 检测是否需要使用 sudo (OpenWrt root 用户不强制要求)
+SUDO_CMD=""
+if [ "$EUID" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        SUDO_CMD="sudo"
+    else
+        echo "错误: 当前非 root 用户且系统中未找到 sudo。"
+        exit 1
+    fi
+fi
+
+# --- 文档查阅逻辑 ---
 show_doc() {
     local doc_file="$META_DIR/$TOOL_NAME.md"
     if [ ! -f "$doc_file" ]; then
@@ -77,13 +87,20 @@ get_file_mtime() {
 
 # 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
 get_download_url() {
+    # 优先从命令行参数获取 (针对 bash -s -- URL)
+    if [[ "$1" =~ ^http ]]; then
+        echo "$1"
+        return
+    fi
+    
+    # 备选：从进程树捕获
     local pid=$$
-    for i in {1..10}; do
+    for i in {1..5}; do
         local ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
         [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
-        local cmdlines=$(pgrep -P $ppid | xargs -I {} cat /proc/{}/cmdline 2>/dev/null | tr '\0' ' ')
-        local url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | grep "$TOOL_NAME" | head -1)
-        [ -z "$url" ] && url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | head -1)
+        # OpenWrt cat /proc/pid/cmdline 可能因 busybox 限制不可用，增加 grep 检查
+        local cmdlines=$(cat /proc/$ppid/cmdline 2>/dev/null | tr '\0' ' ')
+        local url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | head -1)
         [ -n "$url" ] && echo "$url" && return
         pid=$ppid
     done
@@ -193,13 +210,21 @@ for arg in "$@"; do
     if [ "$arg" == "-doc" ]; then show_doc; fi
 done
 
-# --- 第一阶段: 管道自安装 ---
-if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ] && [[ "$0" =~ (bash|sh|/tmp/.*)$ ]] || [ ! -f "$0" ]; then
-    if [ "$EUID" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
-    URL=$(get_download_url)
-    if [ -n "$URL" ]; then do_install "$TOOL_NAME" "$URL"
-    else echo "无法确定来源，请通过 'sudo $TOOL_NAME add <URL>' 注册自身"; fi
-    echo ""; exit 0
+# --- 第一阶段: 自注册/安装逻辑优化 ---
+# 判断条件：如果当前运行的文件名不是目标路径，或者是从管道/临时目录运行的
+if [ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" ]; then
+    # 获取下载 URL (尝试从第一个参数 $1 获取，那是 bash -s 传进来的)
+    URL=$(get_download_url "$1")
+    
+    if [ -n "$URL" ]; then
+        # 这里的 do_install 需要调用者具备权限
+        do_install "$TOOL_NAME" "$URL"
+    else
+        echo "无法确定来源。建议手动注册:"
+        echo "github-tools add <URL>"
+    fi
+    echo ""
+    exit 0
 fi
 
 # --- 第二阶段: 管理逻辑 ---
