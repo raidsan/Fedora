@@ -5,7 +5,7 @@
 # 1. 帮助: github-tools help / -v  /-doc 查阅md文档
 # 2. 列出: github-tools (不带参数)
 # 3. 新增: <sudo> github-tools add <URL 或 相对路径>
-# 4. 更新: <sudo> github-tools update - 全部更新 (自动检测 HASH 变动并同步文档)
+# 4. 更新: <sudo> github-tools update 全部更新 (自动检测 HASH 变动并同步文档)
 # 依赖: curl, sha256sum, grep, awk, ps
 # 管理: /usr/local/share/github-tools-meta/
 # ==============================================================================
@@ -19,9 +19,23 @@ META_DIR="/usr/local/share/github-tools-meta"
 [ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR" 2>/dev/null
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# 检测是否需要使用 sudo (OpenWrt root 用户不强制要求)
+# 自动设置 PATH 环境变量 (针对 OpenWrt)
+setup_path() {
+    if ! echo "$PATH" | grep -q "$DEST_DIR"; then
+        export PATH="$PATH:$DEST_DIR"
+        # 永久写入配置文件
+        local profile="/etc/profile"
+        if [ -f "$profile" ] && ! grep -q "$DEST_DIR" "$profile"; then
+            echo "export PATH=\$PATH:$DEST_DIR" >> "$profile"
+            echo "已将 $DEST_DIR 加入 $profile，请执行 'source $profile' 或重新登录。"
+        fi
+    fi
+}
+
+# 检测权限 (兼容 ash)
+CURRENT_UID=$(id -u)
 SUDO_CMD=""
-if [ "$EUID" -ne 0 ]; then
+if [ "$CURRENT_UID" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
         SUDO_CMD="sudo"
     else
@@ -192,6 +206,9 @@ do_install() {
         fi
     fi
     rm -f "$tmp_file"
+    
+    # 安装完成后尝试修复路径
+    [ "$name" = "$TOOL_NAME" ] && setup_path
 }
 
 # 打印帮助信息
@@ -225,12 +242,12 @@ else
 fi
 
 if [ "$CURRENT_REALPATH" != "$DEST_PATH" ] || [ "$IS_PIPE" -eq 1 ]; then
+    setup_path # 运行即尝试修复当前会话 PATH
     URL=$(get_download_url "$1")
     if [ -n "$URL" ]; then
         do_install "$TOOL_NAME" "$URL"
     else
-        echo "无法确定来源。建议手动注册:"
-        echo "github-tools add <URL>"
+        echo "无法确定来源。建议手动注册: github-tools add <URL>"
     fi
     echo ""
     exit 0
