@@ -1,18 +1,14 @@
 # github-tools.sh 功能说明文档
 
-`github-tools` 是一个为 Linux 系统（尤其是 Fedora）设计的轻量级、自举式脚本管理工具。它通过追踪 GitHub 下载链接和 SHA256 哈希值，实现对运维脚本的安装、文档同步及自动化更新。
+`github-tools` 是一个为 Linux 系统设计的轻量级脚本管理工具。它通过追踪 GitHub 下载链接和 SHA256 哈希值，实现安装、文档同步及自动化更新。
 
 ---
 
 ## 1. 核心特性
 
 - **自动化安装注册**：支持通过 URL 一键安装脚本至 `/usr/local/bin`。
-- **文档自动同步**：更新或添加脚本时，自动探测并同步同名的 .md 说明文档。
-- **版本与 HASH 监控**：记录每个工具的下载来源、更新时间及文件哈希，确保代码一致性。
-- **智能更新机制**：
-  - `update`：一键对比远程 Hash，仅更新有变动的工具。。
-  - `update <name>`：使用记录中的原始链接针对性更新指定工具。
-- **自举更新**：具备自我更新能力，并在批量更新时自动将自身置于最后执行，确保管理程序始终最新。
+- **自动化初始化 (-init)**：更新后自动探测并执行脚本的初始化逻辑。
+- **文档自动同步**：更新工具时，自动同步同名的 `.md` 说明文档。
 - **规范化存储**：严格遵循 Linux 路径标准，分离可执行文件与共享元数据。
 
 ---
@@ -38,45 +34,19 @@ export TOOLS_URL=$MAIN/github-tools.sh
 curl -sL $TOOLS_URL | <sudo> bash -s -- $TOOLS_URL
 ```
 
-### 2.2 帮助与版本信息
-* 参数：help, -v 或任意未知参数
-  显示参数说明及使用指南。
-* -doc
-  显示对应 md 文档
-  
-### 2.3 列出已安装工具
-```Bash
-sudo github-tools
-```
-不带参数执行时，将以表格形式展示已安装工具的更新时间、来源 URL 以及 HASH 简码。
+### 2.2 常用命令
 
-### 2.4 新增/覆盖工具 (add)
-```Bash
-sudo github-tools add <URL>
-```
-* 脚本安装：如果工具名不存在，下载并安装脚本至 /usr/local/bin。
-* 文档抓取：自动尝试下载 URL 同级目录下的 .md 文件（如 example.sh 对应 example.md）。
-* 覆盖机制：如果工具名已存在，则视为强制更新，并记录新的 URL（适用于切换镜像源，文件所在网址目录变化）。
+* 列出工具：sudo github-tools。
 
-### 2.5 批量更新 (update)
-```Bash
-sudo github-tools update
-```
-脚本将遍历元数据目录，对比远程 Hash，发现变动则自动下载并同步新版文档。
+* 新增工具：sudo github-tools add <URL>。
 
-### 2.6 更新指定工具
-```Bash
-sudo github-tools update <工具名称>
-```
-例如：sudo github-tools update ollama_blobs。脚本会提取该工具最后一次记录的 URL 进行更新。
+* 批量更新：sudo github-tools update。
 
-* 使用记录在 .version 中的原始 URL 更新自身
-URL=$(tail -n 1 /usr/local/share/github-tools-meta/github-tools.version | cut -f2)
-curl -sL $URL | sudo bash -s -- $URL
+* 查阅文档：netinfo -doc (需工具支持)。
 
 ---
 
-## 3. 设计说明
+## 3. 技术规范
 
 ### 3.1 参数规划表
 | 参数 | 描述 |
@@ -102,7 +72,7 @@ netinfo -doc
 | 类型 | 路径 | 说明 |
 | --- | --- | --- |
 | 可执行文件 | /usr/local/bin/ | 系统级工具路径 |
-| 元数据记录 | /usr/local/share/github-tools-meta/*.version | 记录 时间 \t URL \t HASH |
+| 元数据记录 | /usr/local/share/github-tools-meta/*.version | 记录格式：时间 \t <URL> \t HASH |
 | 说明文档 | /usr/local/share/github-tools-meta/*.md | 供工具通过 -doc 参数调用 |
 
 ### 3.5 异常处理与偏好
@@ -114,5 +84,7 @@ netinfo -doc
 openwrt使用的ash 语法不支持 ==， d$'\t'
 
 ### 3.7 自动化初始化规范 (-init)
-* 机制：github-tools 在安装或更新脚本后，会自动执行 grep 探测脚本内容。若发现脚本包含对 -init 或 --init 参数的处理逻辑，将自动以 root 权限运行一次该脚本的初始化命令。
-* 用途：适用于注入环境变量（如 PROMPT_COMMAND）、安装系统依赖（如 tmux）或创建必要的配置目录。
+
+* 触发机制：github-tools 在安装或更新后，会检查脚本是否包含 -init 关键字。
+
+* 执行逻辑：若匹配，则自动运行 script -init。这用于自动安装依赖（如 tmux）或写入环境变量（如 PROMPT_COMMAND）。

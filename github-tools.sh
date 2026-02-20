@@ -69,7 +69,7 @@ show_doc() {
 get_base_url() {
     local v_file="$META_DIR/$TOOL_NAME.version"
     if [ -f "$v_file" ]; then
-        local full_url=$(tail -n 1 "$v_file" | cut -d'	' -f2)
+        local full_url=$(tail -n 1 "$v_file" | cut -f2)
         echo "${full_url%/*}" # 返回去掉文件名的部分
     fi
 }
@@ -77,7 +77,6 @@ get_base_url() {
 # 解析输入参数 (URL or Path)
 resolve_url() {
     local input=$1
-    # 兼容 ash 的字符串匹配
     case "$input" in
         http*) echo "$input" ;;
         *)
@@ -103,17 +102,14 @@ get_file_mtime() {
 
 # 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
 get_download_url() {
-    # 优先从命令行参数获取 (针对 (b)ash -s -- URL)
     case "$1" in
         http*) echo "$1"; return ;;
     esac
     
-    # 备选：从进程树捕获
     local pid=$$
     for i in 1 2 3 4 5; do
         local ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
         [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
-        # OpenWrt cat /proc/pid/cmdline 可能因 busybox 限制不可用，增加 grep 检查
         local cmdlines=$(cat /proc/$ppid/cmdline 2>/dev/null | tr '\0' ' ')
         local url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | head -1)
         [ -n "$url" ] && echo "$url" && return
@@ -133,19 +129,18 @@ save_metadata() {
     printf "%s\t%s\t%s\n" "$(date '+%Y-%m-%d/%H:%M:%S')" "$url" "$m_hash" >> "$v_file" 2>/dev/null
 }
 
-# 无缓存下载核心 (注入时间戳与请求头屏蔽 GitHub 缓存)
+# 无缓存下载核心
 curl_no_cache() {
     local url=$1
     local out=$2
     local sep="?"
-    # 检查 URL 是否已包含问号
     echo "$url" | grep -q '?' && sep="&"
     local fresh_url="${url}${sep}t=$(date +%s%N)"
     
     curl -sL -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
 }
 
-# 安装/更新核心逻辑
+# 安装/更新核心逻辑 (已集成 -init 协议)
 do_install() {
     local name=$1
     local url=$2
@@ -156,7 +151,7 @@ do_install() {
     echo "--- 正在处理: $name ---"
     echo "本地版本时间: $(get_file_mtime "$dest")"
     
-    # 1. 提取本地记录信息(使用标准制表符分隔)
+    # 1. 提取本地记录信息 (使用制表符)
     local rec_hash=""
     if [ -f "$v_file" ]; then
         rec_hash=$(tail -n 1 "$v_file" | cut -f3)
@@ -164,13 +159,13 @@ do_install() {
 
     # 2. 提取物理文件 Hash
     local cur_hash=""
-    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -f1)
+    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
 
     # 3. 获取远程文件 (使用防缓存下载)
     if ! curl_no_cache "$url" "$tmp_file"; then
         echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
     fi
-    local rem_hash=$(sha256sum "$tmp_file" | cut -f1)
+    local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
 
     # --- 逻辑判定矩阵 ---
     if [ "$rem_hash" = "$rec_hash" ]; then
@@ -198,8 +193,9 @@ do_install() {
             save_metadata "$name" "$url"
             
             # --- 核心改进：显式初始化协议 ---
-            # 对除自身外的工具，探测是否支持 -init 参数
-            if [ "$name" != "$TOOL_NAME" ] && grep -qE "(-init|--init)" "$dest"; then
+            if [ "$name" = "$TOOL_NAME" ]; then
+                setup_path
+            elif grep -qE "(-init|--init)" "$dest"; then
                 echo "检测到初始化接口，正在执行环境配置..."
                 "$dest" -init
             fi
@@ -213,9 +209,6 @@ do_install() {
         fi
     fi
     rm -f "$tmp_file"
-    
-    # 安装完成后尝试修复路径 (如果是自身则触发)
-    [ "$name" = "$TOOL_NAME" ] && setup_path
 }
 
 # 打印帮助信息
@@ -236,10 +229,9 @@ for arg in "$@"; do
     if [ "$arg" = "-doc" ]; then show_doc; fi
 done
 
-# --- 第一阶段: 自注册/安装逻辑优化 ---
+# --- 第一阶段: 自注册/安装逻辑 ---
 CURRENT_REALPATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
 IS_PIPE=0
-# 使用更兼容的模式匹配检查运行环境
 if [ ! -f "$0" ]; then
     IS_PIPE=1
 else
@@ -249,7 +241,7 @@ else
 fi
 
 if [ "$CURRENT_REALPATH" != "$DEST_PATH" ] || [ "$IS_PIPE" -eq 1 ]; then
-    setup_path # 运行即尝试修复当前会话 PATH
+    setup_path
     URL=$(get_download_url "$1")
     if [ -n "$URL" ]; then
         do_install "$TOOL_NAME" "$URL"
@@ -274,10 +266,8 @@ if [ -z "$1" ]; then
             [ ! -e "$vfile" ] && break
             T_NAME=$(basename "$vfile" .version)
             LAST_LINE=$(tail -n 1 "$vfile")
-            # 兼容 ash 的 IFS 读取
-            m_time=$(echo "$LAST_LINE" | cut -d'	' -f1)
-            T_URL=$(echo "$LAST_LINE" | cut -d'	' -f2)
-            T_HASH=$(echo "$LAST_LINE" | cut -d'	' -f3)
+            m_time=$(echo "$LAST_LINE" | cut -f1)
+            T_HASH=$(echo "$LAST_LINE" | cut -f3)
             DOC_STAT="×"; [ -f "$META_DIR/$T_NAME.md" ] && DOC_STAT="√"
             printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "$(echo $T_HASH | cut -c1-12)..."
         done
@@ -298,7 +288,7 @@ if [ "$1" = "update" ]; then
     if [ -n "$2" ]; then
         VFILE="$META_DIR/$2.version"
         if [ -f "$VFILE" ]; then
-            URL=$(tail -n 1 "$VFILE" | cut -d'	' -f2)
+            URL=$(tail -n 1 "$VFILE" | cut -f2)
             do_install "$2" "$URL"
         fi
     else
@@ -306,7 +296,7 @@ if [ "$1" = "update" ]; then
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
-            T_URL=$(tail -n 1 "$vfile" | cut -d'	' -f2)
+            T_URL=$(tail -n 1 "$vfile" | cut -f2)
             if [ "$T_NAME" = "$TOOL_NAME" ]; then
                 SELF_URL="$T_URL"
                 continue
