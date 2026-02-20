@@ -70,6 +70,10 @@ sudo github-tools update <工具名称>
 ```
 例如：sudo github-tools update ollama_blobs。脚本会提取该工具最后一次记录的 URL 进行更新。
 
+* 使用记录在 .version 中的原始 URL 更新自身
+URL=$(tail -n 1 /usr/local/share/github-tools-meta/github-tools.version | cut -f2)
+curl -sL $URL | sudo bash -s -- $URL
+
 ---
 
 ## 3. 设计说明
@@ -108,3 +112,7 @@ netinfo -doc
 
 ### 3.6 脚本适配了 ash 语法和root运行环境
 openwrt使用的ash 语法不支持 ==， d$'\t'
+
+### 3.7 自动化初始化规范 (-init)
+* 机制：github-tools 在安装或更新脚本后，会自动执行 grep 探测脚本内容。若发现脚本包含对 -init 或 --init 参数的处理逻辑，将自动以 root 权限运行一次该脚本的初始化命令。
+* 用途：适用于注入环境变量（如 PROMPT_COMMAND）、安装系统依赖（如 tmux）或创建必要的配置目录。

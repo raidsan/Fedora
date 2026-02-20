@@ -13,77 +13,78 @@
 
 DEST_PATH="/usr/local/bin/ssh_tmux"
 
-# 依赖检查函数 (安装与运行阶段共用)
-ensure_tmux_installed() {
+# 环境初始化函数
+do_init() {
+    echo "--- 开始环境初始化: ssh_tmux ---"
+    
+    # 1. 依赖检查与安装
     if ! command -v tmux >/dev/null 2>&1; then
-        echo "检测到缺失 tmux 依赖，开始执行安装..."
-        if command -v dnf >/dev/null 2>&1; then
-            dnf install -y tmux
-        elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y tmux
-        elif command -v opkg >/dev/null 2>&1; then
-            opkg update && opkg install tmux
-        else
-            echo "错误: 无法识别的包管理器，请手动安装 tmux。"
-            exit 1
+        echo "安装依赖: tmux..."
+        if command -v dnf >/dev/null 2>&1; then dnf install -y tmux
+        elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y tmux
+        elif command -v opkg >/dev/null 2>&1; then opkg update && opkg install tmux
         fi
-        echo "tmux 安装完成。"
     fi
-}
 
-# --- 第一阶段: 安装/更新逻辑 ---
-# 判定条件：不在目标路径运行，或者是通过管道/临时目录运行
-CURRENT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
-if [ "$CURRENT_PATH" != "$DEST_PATH" ]; then
-    # 权限检查 (OpenWrt root 适配)
-    if [ "$(id -u)" -ne 0 ]; then echo "错误: 请使用 sudo 权限运行安装。"; exit 1; fi
-    
-    echo "--- 开始安装/更新 ssh_tmux ---"
-    
-    # 1. 强制检查并安装依赖 (确保更新时依赖同步安装)
-    ensure_tmux_installed
-    
-    # 2. 部署可执行文件
-    cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
-    
-    # 3. 环境变量与历史同步配置 (幂等处理)
-    CONF_FILE="$HOME/.bashrc"
+    # 2. 环境变量与历史同步配置 (幂等处理)
+    local CONF_FILE="$HOME/.bashrc"
+	# 适配 OpenWrt/ash 环境
     [ ! -f "$CONF_FILE" ] && [ -f "$HOME/.profile" ] && CONF_FILE="$HOME/.profile"
     
     if [ -f "$CONF_FILE" ]; then
-        shell_exe=$(readlink -f /proc/$$/exe 2>/dev/null || ps -p $$ -o comm= 2>/dev/null || echo "$SHELL")
-        shell_name=$(basename "$shell_exe")
-        
+        local shell_exe=$(readlink -f /proc/$$/exe 2>/dev/null || ps -p $$ -o comm= 2>/dev/null || echo "$SHELL")
+        local shell_name=$(basename "$shell_exe")
+		
+		# 仅针对支持 PROMPT_COMMAND 的 Bash 进行注入
         if [ "$shell_name" = "bash" ]; then
-            line_to_add='export PROMPT_COMMAND="history -a; $PROMPT_COMMAND"'
-            # 只有不存在时才写入，防止重复定义
-            if ! grep -Fxq "$line_to_add" "$CONF_FILE"; then
-                echo "$line_to_add" >> "$CONF_FILE"
-                echo "已在 $CONF_FILE 中配置历史记录实时同步。"
+            local line='export PROMPT_COMMAND="history -a; $PROMPT_COMMAND"'
+            if ! grep -Fxq "$line" "$CONF_FILE"; then
+                echo "$line" >> "$CONF_FILE"
+                echo "已向 $CONF_FILE 注入历史实时同步配置。"
             fi
         fi
     fi
+    echo "✅ 初始化完成。"
+}
+
+# --- 参数解析 ---
+case "$1" in
+    -init|--init|install)
+        [ "$(id -u)" -ne 0 ] && echo "错误: 操作需 root 权限。" && exit 1
+        do_init
+        exit 0
+        ;;
+esac
+
+# --- 第一阶段: 兼容性安装逻辑 (非安装路径运行或手动安装时触发) ---
+CURRENT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+if [ "$CURRENT_PATH" != "$DEST_PATH" ] && [[ "$0" != *"bash"* ]]; then
+    echo "--- 检测到安装/更新需求 ---"
+    if [ "$(id -u)" -ne 0 ]; then echo "错误: 安装需 root 权限。"; exit 1; fi
+            
+    # 1. 部署可执行文件
+    cat "$0" > "$DEST_PATH" && chmod +x "$DEST_PATH"
+	echo "文件已部署至 $DEST_PATH"
     
-    echo "✅ ssh_tmux 已成功安装/更新至 $DEST_PATH"
+    # 2. 调用自身的 init 逻辑完成剩下的依赖检查和环境配置
+    "$DEST_PATH" -init
+    
+    echo "✅ ssh_tmux 完整安装/更新成功。"
     echo ""
     exit 0
 fi
 
 # --- 第二阶段: 运行时逻辑 ---
-
 run_tmux() {
     # 仅在交互式终端且不在已有 tmux 会话中时执行
     if [ -z "$TMUX" ] && [ -t 0 ]; then
-        # 运行时兜底检查，防止 tmux 被意外卸载
-        ensure_tmux_installed
-        
         local identifier=${1:-session}
         local session_name="ssh_$identifier"
         local hist_dir="$HOME/.tmux_history"
         local session_hist="$hist_dir/ssh_$identifier"
         
+		# 确保历史记录目录存在
         [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
-
         echo "接入会话: $session_name (历史路径: $session_hist)"
 
         # 启动会话并隔离历史文件

@@ -145,7 +145,7 @@ curl_no_cache() {
     curl -sL -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
 }
 
-# 安装/更新核心逻辑 (精简输出版 + 防缓存)
+# 安装/更新核心逻辑
 do_install() {
     local name=$1
     local url=$2
@@ -156,21 +156,21 @@ do_install() {
     echo "--- 正在处理: $name ---"
     echo "本地版本时间: $(get_file_mtime "$dest")"
     
-    # 1. 提取本地记录信息
+    # 1. 提取本地记录信息(使用标准制表符分隔)
     local rec_hash=""
     if [ -f "$v_file" ]; then
-        rec_hash=$(tail -n 1 "$v_file" | cut -d'	' -f3)
+        rec_hash=$(tail -n 1 "$v_file" | cut -f3)
     fi
 
     # 2. 提取物理文件 Hash
     local cur_hash=""
-    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
+    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -f1)
 
     # 3. 获取远程文件 (使用防缓存下载)
     if ! curl_no_cache "$url" "$tmp_file"; then
         echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
     fi
-    local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
+    local rem_hash=$(sha256sum "$tmp_file" | cut -f1)
 
     # --- 逻辑判定矩阵 ---
     if [ "$rem_hash" = "$rec_hash" ]; then
@@ -197,17 +197,24 @@ do_install() {
             chmod +x "$dest"
             save_metadata "$name" "$url"
             
-            # 同步 .md 文档 (同样使用防缓存下载)
+            # --- 核心改进：显式初始化协议 ---
+            # 对除自身外的工具，探测是否支持 -init 参数
+            if [ "$name" != "$TOOL_NAME" ] && grep -qE "(-init|--init)" "$dest"; then
+                echo "检测到初始化接口，正在执行环境配置..."
+                "$dest" -init
+            fi
+        
+            # 同步 .md 文档
             local doc_url="${url%.sh}.md"
             curl_no_cache "$doc_url" "$META_DIR/$name.md" >/dev/null 2>&1
-            echo "✅ 已更新。"
+            echo "✅ $name 已完成更新与初始化。"
         else
             echo "❌ 错误: 无法写入 $dest"
         fi
     fi
     rm -f "$tmp_file"
     
-    # 安装完成后尝试修复路径
+    # 安装完成后尝试修复路径 (如果是自身则触发)
     [ "$name" = "$TOOL_NAME" ] && setup_path
 }
 

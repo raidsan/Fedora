@@ -62,6 +62,10 @@ sudo github-tools add linux-tools/ssh_tmux.sh
 ```Bash
 sudo github-tools update ssh_tmux
 ```
+github-tools 会探测到其中的 -init 关键字并自动调用，实现全自动更新和环境刷新。
+
+### 4.3 手动维护
+如果你发现 history 记录没有实时保存，直接运行 sudo ssh_tmux -init 即可修复环境配置。
 
 ---
 
