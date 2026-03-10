@@ -137,7 +137,14 @@ curl_no_cache() {
     echo "$url" | grep -q '?' && sep="&"
     local fresh_url="${url}${sep}t=$(date +%s%N)"
     
-    curl -sL -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
+    # 增加 --fail 参数，让 curl 在 HTTP 错误（如 404）时返回非 0 状态码
+    if curl -sL --fail -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"; then
+        return 0
+    else
+        # 如果 curl 失败或检测到 404（有些代理环境下 --fail 可能失效，此处加一层保险）
+        [ -f "$out" ] && grep -q "404: Not Found" "$out" && rm -f "$out"
+        return 1
+    fi
 }
 
 # 安装/更新核心逻辑 (已集成 -init 协议)
