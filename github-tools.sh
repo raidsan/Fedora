@@ -1,3 +1,5 @@
+# 源码文件名: github-tools.sh
+
 #!/bin/bash
 
 # ==============================================================================
@@ -19,19 +21,6 @@ META_DIR="/usr/local/share/github-tools-meta"
 [ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR" 2>/dev/null
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# 自动设置 PATH 环境变量 (针对 OpenWrt)
-setup_path() {
-    if ! echo "$PATH" | grep -q "$DEST_DIR"; then
-        export PATH="$PATH:$DEST_DIR"
-        # 永久写入配置文件
-        local profile="/etc/profile"
-        if [ -f "$profile" ] && ! grep -q "$DEST_DIR" "$profile"; then
-            echo "export PATH=\$PATH:$DEST_DIR" >> "$profile"
-            echo "已将 $DEST_DIR 加入 $profile，请执行 'source $profile' 或重新登录。"
-        fi
-    fi
-}
-
 # 检测权限 (兼容 ash)
 CURRENT_UID=$(id -u)
 SUDO_CMD=""
@@ -43,6 +32,19 @@ if [ "$CURRENT_UID" -ne 0 ]; then
         exit 1
     fi
 fi
+
+# 自动设置 PATH 环境变量 (针对 OpenWrt)
+setup_path() {
+    if ! echo "$PATH" | grep -q "$DEST_DIR"; then
+        export PATH="$PATH:$DEST_DIR"
+        # 永久写入配置文件
+        local profile="/etc/profile"
+        if [ -f "$profile" ] && ! grep -q "$DEST_DIR" "$profile"; then
+            echo "export PATH=\"\$PATH:$DEST_DIR\"" >> "$profile"
+            echo "已将 $DEST_DIR 加入 $profile，请执行 'source $profile' 或重新登录。"
+        fi
+    fi
+}
 
 # --- 文档查阅逻辑 ---
 show_doc() {
@@ -74,62 +76,7 @@ get_base_url() {
     fi
 }
 
-# 解析输入参数 (URL or Path)
-resolve_url() {
-    local input=$1
-    case "$input" in
-        http*) echo "$input" ;;
-        *)
-            local base=$(get_base_url)
-            if [ -z "$base" ]; then
-                echo "错误: 无法获取根路径，请先使用完整 URL 安装 $TOOL_NAME" >&2
-                exit 1
-            fi
-            echo "$base/${input#*/}"
-            ;;
-    esac
-}
-
-# 获取本地文件修改时间
-get_file_mtime() {
-    local file=$1
-    if [ -f "$file" ]; then
-        date -r "$file" "+%Y-%m-%d %H:%M:%S"
-    else
-        echo "不存在"
-    fi
-}
-
-# 获取下载 URL (通过追溯进程树捕获 curl | bash 管道中的源链接)
-get_download_url() {
-    case "$1" in
-        http*) echo "$1"; return ;;
-    esac
-    
-    local pid=$$
-    for i in 1 2 3 4 5; do
-        local ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
-        [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
-        local cmdlines=$(cat /proc/$ppid/cmdline 2>/dev/null | tr '\0' ' ')
-        local url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | head -1)
-        [ -n "$url" ] && echo "$url" && return
-        pid=$ppid
-    done
-}
-
-# 记录版本信息
-save_metadata() {
-    local name=$1
-    local url=$2
-    local v_file="$META_DIR/$name.version"
-    local m_hash=$(sha256sum "$DEST_DIR/$name" 2>/dev/null | cut -d' ' -f1)
-    
-    [ -z "$m_hash" ] && return 1
-    # 使用标准制表符写入
-    printf "%s\t%s\t%s\n" "$(date '+%Y-%m-%d/%H:%M:%S')" "$url" "$m_hash" >> "$v_file" 2>/dev/null
-}
-
-# 无缓存下载核心
+# 无缓存下载逻辑 (修复 404 检测)
 curl_no_cache() {
     local url=$1
     local out=$2
@@ -137,85 +84,93 @@ curl_no_cache() {
     echo "$url" | grep -q '?' && sep="&"
     local fresh_url="${url}${sep}t=$(date +%s%N)"
     
-    # 增加 --fail 参数，让 curl 在 HTTP 错误（如 404）时返回非 0 状态码
-    if curl -sL --fail -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"; then
-        return 0
-    else
-        # 如果 curl 失败或检测到 404（有些代理环境下 --fail 可能失效，此处加一层保险）
-        [ -f "$out" ] && grep -q "404: Not Found" "$out" && rm -f "$out"
-        return 1
-    fi
+    # 增加 --fail 参数，使 404 等错误时 curl 返回非 0 退出码
+    curl -sL --fail -H "Pragma: no-cache" -H "Cache-Control: no-cache" "$fresh_url" -o "$out"
 }
 
-# 安装/更新核心逻辑 (已集成 -init 协议)
-do_install() {
-    local name=$1
-    local url=$2
-    local dest="$DEST_DIR/$name"
-    local v_file="$META_DIR/$name.version"
-    local tmp_file=$(mktemp)
-    
-    echo "--- 正在处理: $name ---"
-    echo "本地版本时间: $(get_file_mtime "$dest")"
-    
-    # 1. 提取本地记录信息 (使用制表符)
-    local rec_hash=""
+# 自动解析 URL
+resolve_url() {
+    local input="$1"
+    local name=$(basename "$input" .sh)
+    local v_file="$META_DIR/${name}.version"
+
+    # 1. 如果输入本身就是完整 URL
+    if [[ "$input" == http* ]]; then
+        echo "$input"
+        return
+    fi
+
+    # 2. 如果本地已有版本记录，优先使用记录中的全路径进行更新
     if [ -f "$v_file" ]; then
-        rec_hash=$(tail -n 1 "$v_file" | cut -f3)
+        tail -n 1 "$v_file" | cut -f2
+        return
     fi
 
-    # 2. 提取物理文件 Hash
-    local cur_hash=""
-    [ -f "$dest" ] && cur_hash=$(sha256sum "$dest" | cut -d' ' -f1)
+    # 3. 否则，使用 github-tools 所在的路径 (Main 路径) 拼接相对路径
+    local main_url=$(get_base_url)
+    if [ -z "$main_url" ]; then
+        echo "错误: 无法确定 Main URL，请先通过 URL 安装 github-tools。" >&2
+        exit 1
+    fi
+    echo "${main_url}/${input}"
+}
 
-    # 3. 获取远程文件 (使用防缓存下载)
+# 执行安装/更新逻辑
+do_install() {
+    local name="$1"
+    local url="$2"
+    local vfile="$META_DIR/$name.version"
+    local tmp_file="/tmp/$name.sh.tmp"
+    local tmp_md="/tmp/$name.md.tmp"
+
+    echo "--- 正在处理: $name ---"
+
+    # 1. 下载脚本 (通过 curl_no_cache 拦截 404)
     if ! curl_no_cache "$url" "$tmp_file"; then
-        echo "❌ 错误: 下载失败 $url"; rm -f "$tmp_file"; return 1
+        echo "错误: 无法下载脚本 (可能是 404 错误): $url"
+        return 1
     fi
-    local rem_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
 
-    # --- 逻辑判定矩阵 ---
-    if [ "$rem_hash" = "$rec_hash" ]; then
-        if [ "$cur_hash" = "$rec_hash" ]; then
-            echo "没有新版本。"
-        else
-            echo "⚠️  远程内容未更新，但本地文件已被外部修改，不作处理。"
+    local new_hash=$(sha256sum "$tmp_file" | awk '{print $1}')
+    local old_hash=""
+    [ -f "$vfile" ] && old_hash=$(tail -n 1 "$vfile" | cut -f3)
+
+    # 2. 冲突检查与覆盖逻辑
+    if [ -f "$DEST_DIR/$name" ]; then
+        local current_hash=$(sha256sum "$DEST_DIR/$name" | awk '{print $1}')
+        if [ "$current_hash" != "$old_hash" ] && [ "$current_hash" != "$new_hash" ]; then
+             echo "本地版本时间: $(ls -l --time-style=+"%Y-%m-%d %H:%M:%S" "$DEST_DIR/$name" | awk '{print $6, $7}')"
+             echo "⚠️  检测到远程更新，但本地文件已被外部修改。"
+             read -p "是否使用远程版本覆盖本地修改？(y/n): " confirm
+             if [[ "$confirm" != "y" ]]; then
+                 echo "跳过 $name。"
+                 rm -f "$tmp_file"
+                 return 0
+             fi
         fi
-        rm -f "$tmp_file"; return 0
+    fi
+
+    # 3. 部署脚本
+    $SUDO_CMD mv "$tmp_file" "$DEST_DIR/$name"
+    $SUDO_CMD chmod +x "$DEST_DIR/$name"
+
+    # 4. 同步文档 (.md)
+    local md_url="${url%.sh}.md"
+    if curl_no_cache "$md_url" "$tmp_md"; then
+        $SUDO_CMD mv "$tmp_md" "$META_DIR/$name.md"
     else
-        if [ -f "$dest" ] && [ "$cur_hash" != "$rec_hash" ]; then
-            echo "⚠️  检测到远程更新，但本地文件已被外部修改。"
-            printf "是否使用远程版本覆盖本地修改？(y/n): "
-            read confirm
-            case "$confirm" in
-                [Yy]*) ;;
-                *) echo "操作已取消。"; rm -f "$tmp_file"; return 0 ;;
-            esac
-        else
-            echo "检测到新版本。"
-        fi
-
-        if cat "$tmp_file" > "$dest" 2>/dev/null; then
-            chmod +x "$dest"
-            save_metadata "$name" "$url"
-            
-            # --- 核心改进：显式初始化协议 ---
-            if [ "$name" = "$TOOL_NAME" ]; then
-                setup_path
-            elif grep -qE "(-init|--init)" "$dest"; then
-                echo "检测到初始化接口，正在执行环境配置..."
-                "$dest" -init
-            fi
-        
-            # 同步 .md 文档
-            local doc_url="${url%.sh}.md"
-            curl_no_cache "$doc_url" "$META_DIR/$name.md" >/dev/null 2>&1
-            echo "✅ $name 已完成更新与初始化。"
-        else
-            echo "❌ 错误: 无法写入 $dest"
-        fi
+        rm -f "$tmp_md" 2>/dev/null
     fi
-    rm -f "$tmp_file"
+
+    # 5. 更新版本记录
+    echo -e "$(date +'%Y-%m-%d/%H:%M:%S')\t$url\t$new_hash" | $SUDO_CMD tee -a "$vfile" > /dev/null
+
+    # 6. 执行初始化 (-init)
+    if grep -q "\-init" "$DEST_DIR/$name"; then
+        "$DEST_DIR/$name" -init
+    fi
+
+    echo "✅ $name 已完成更新与初始化。"
 }
 
 # 打印帮助信息
@@ -231,43 +186,28 @@ show_help() {
     echo "  sudo $TOOL_NAME update <名称>  更新指定工具"
 }
 
-# 拦截 -doc 参数
-for arg in "$@"; do
-    if [ "$arg" = "-doc" ]; then show_doc; fi
-done
+# --- 主程序逻辑 ---
 
-# --- 第一阶段: 自注册/安装逻辑 ---
-CURRENT_REALPATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
-IS_PIPE=0
-if [ ! -f "$0" ]; then
-    IS_PIPE=1
-else
-    case "$0" in
-        *bash*|*sh*|/tmp/*) IS_PIPE=1 ;;
-    esac
-fi
-
-if [ "$CURRENT_REALPATH" != "$DEST_PATH" ] || [ "$IS_PIPE" -eq 1 ]; then
-    setup_path
-    URL=$(get_download_url "$1")
-    if [ -n "$URL" ]; then
-        do_install "$TOOL_NAME" "$URL"
-    else
-        echo "无法确定来源。建议手动注册: github-tools add <URL>"
-    fi
-    echo ""
+# 自注册逻辑 (处理 curl ... | bash -s -- URL)
+if [[ "$1" == http* ]]; then
+    do_install "$TOOL_NAME" "$1"
     exit 0
 fi
 
-# --- 第二阶段: 管理逻辑 ---
-
-if [ "$1" = "help" ] || [ "$1" = "-v" ]; then
+# 帮助/文档逻辑
+if [ "$1" = "help" ] || [ "$1" = "-v" ] || [ "$1" = "--help" ]; then
     show_help; echo ""; exit 0
 fi
 
+if [ "$1" = "-doc" ]; then
+    show_doc
+fi
+
+# 列表展示逻辑
 if [ -z "$1" ]; then
-    printf "%-15s %-20s %-10s %-s\n" "工具名称" "最近更新" "文档" "HASH(部分)"
-    printf "%-15s %-20s %-10s %-s\n" "---------------" "-------------------" "----------" "----------------"
+    echo "已安装工具列表 (位置: $META_DIR):"
+    printf "%-15s %-20s %-10s %-s\n" "名称" "最后更新时间" "文档" "SHA256(前12位)"
+    echo "----------------------------------------------------------------------------"
     if [ -d "$META_DIR" ]; then
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && break
@@ -276,7 +216,7 @@ if [ -z "$1" ]; then
             m_time=$(echo "$LAST_LINE" | cut -f1)
             T_HASH=$(echo "$LAST_LINE" | cut -f3)
             DOC_STAT="×"; [ -f "$META_DIR/$T_NAME.md" ] && DOC_STAT="√"
-            printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "$(echo $T_HASH | cut -c1-12)..."
+            printf "%-15s %-20s %-10s %-s\n" "$T_NAME" "$m_time" "$DOC_STAT" "$(echo $T_HASH | cut -c1-12)"
         done
     fi
     echo ""; exit 0
@@ -285,7 +225,8 @@ fi
 if [ "$1" = "add" ]; then
     if [ -n "$2" ]; then
         FINAL_URL=$(resolve_url "$2")
-        NAME=$(basename "$FINAL_URL" .sh)
+        # 统一层级存放：通过 basename 提取文件名作为本地指令名
+        NAME=$(basename "$2" .sh)
         do_install "$NAME" "$FINAL_URL"
     fi
     echo ""; exit 0
@@ -297,22 +238,26 @@ if [ "$1" = "update" ]; then
         if [ -f "$VFILE" ]; then
             URL=$(tail -n 1 "$VFILE" | cut -f2)
             do_install "$2" "$URL"
+        else
+            echo "错误: 工具 $2 未安装。"
         fi
     else
-        SELF_URL=""
+        # 批量更新，自身排在最后
         for vfile in "$META_DIR"/*.version; do
-            [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
-            T_URL=$(tail -n 1 "$vfile" | cut -f2)
-            if [ "$T_NAME" = "$TOOL_NAME" ]; then
-                SELF_URL="$T_URL"
-                continue
-            fi
-            do_install "$T_NAME" "$T_URL"
+            [ "$T_NAME" = "$TOOL_NAME" ] && continue
+            URL=$(tail -n 1 "$vfile" | cut -f2)
+            do_install "$T_NAME" "$URL"
         done
-        [ -n "$SELF_URL" ] && do_install "$TOOL_NAME" "$SELF_URL"
+        # 最后更新自己
+        VFILE="$META_DIR/$TOOL_NAME.version"
+        if [ -f "$VFILE" ]; then
+            URL=$(tail -n 1 "$VFILE" | cut -f2)
+            do_install "$TOOL_NAME" "$URL"
+        fi
     fi
     echo ""; exit 0
 fi
 
+setup_path
 echo ""
