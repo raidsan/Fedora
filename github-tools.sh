@@ -17,37 +17,23 @@ DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
 META_DIR="/usr/local/share/github-tools-meta"
 
-# 确保目录存在 (带权限尝试)
+# 确保目录存在
 [ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR" 2>/dev/null
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# 检测权限与 sudo 命令 (兼容 ash/dash)
+# 检测权限 (兼容 ash/dash)
 CURRENT_UID=$(id -u)
 SUDO_CMD=""
 if [ "$CURRENT_UID" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
         SUDO_CMD="sudo"
-    else
-        # 预检：如果后面需要执行 add/update 而又没权限，此处不报错，留给具体操作时判断
-        SUDO_CMD="" 
     fi
 fi
-
-# 检查目标目录是否可写
-check_write_permission() {
-    if [ ! -w "$DEST_DIR" ] || [ ! -w "$META_DIR" ]; then
-        if [ -z "$SUDO_CMD" ] && [ "$CURRENT_UID" -ne 0 ]; then
-            echo "错误: 对 $DEST_DIR 或 $META_DIR 无写权限，且系统中未找到 sudo。"
-            exit 1
-        fi
-    fi
-}
 
 # 自动设置 PATH 环境变量
 setup_path() {
     if ! echo "$PATH" | grep -q "$DEST_DIR"; then
         export PATH="$PATH:$DEST_DIR"
-        # 永久写入配置文件
         local profile="/etc/profile"
         if [ -f "$profile" ] && ! grep -q "$DEST_DIR" "$profile"; then
             echo "export PATH=\"\$PATH:$DEST_DIR\"" >> "$profile"
@@ -100,7 +86,6 @@ curl_no_cache() {
 # 自动解析 URL
 resolve_url() {
     local input="$1"
-    # POSIX 兼容的字符串开头检查
     case "$input" in
         http*) echo "$input" ; return ;;
     esac
@@ -121,10 +106,15 @@ do_install() {
     local tmp_file="/tmp/$name.sh.tmp"
     local tmp_md="/tmp/$name.md.tmp"
 
-    check_write_permission
+    # --- 修正: 增加严格权限预检 ---
+    if [ "$CURRENT_UID" -ne 0 ] && [ -z "$SUDO_CMD" ]; then
+        echo "错误: 操作 $name 需 root 权限，但系统中未找到 sudo。"
+        return 1
+    fi
 
     echo "--- 正在处理: $name ---"
 
+    # 1. 下载脚本
     if ! curl_no_cache "$url" "$tmp_file"; then
         echo "错误: 无法下载脚本 (可能是 404): $url"
         return 1
@@ -134,6 +124,7 @@ do_install() {
     local old_hash=""
     [ -f "$vfile" ] && old_hash=$(tail -n 1 "$vfile" | cut -f3)
 
+    # 2. 冲突检查与覆盖逻辑
     if [ -f "$DEST_DIR/$name" ]; then
         local current_hash=$(sha256sum "$DEST_DIR/$name" | awk '{print $1}')
         if [ "$current_hash" != "$old_hash" ] && [ "$current_hash" != "$new_hash" ]; then
@@ -149,9 +140,15 @@ do_install() {
         fi
     fi
 
-    $SUDO_CMD mv "$tmp_file" "$DEST_DIR/$name"
+    # 3. 部署脚本 (严格检查 mv 结果)
+    if ! $SUDO_CMD mv "$tmp_file" "$DEST_DIR/$name"; then
+        echo "错误: 无法部署脚本到 $DEST_DIR (权限不足?)"
+        rm -f "$tmp_file"
+        return 1
+    fi
     $SUDO_CMD chmod +x "$DEST_DIR/$name"
 
+    # 4. 同步文档 (.md)
     local md_url="${url%.sh}.md"
     if curl_no_cache "$md_url" "$tmp_md"; then
         $SUDO_CMD mv "$tmp_md" "$META_DIR/$name.md"
@@ -159,12 +156,16 @@ do_install() {
         rm -f "$tmp_md" 2>/dev/null
     fi
 
-    # 使用 printf 避免 echo -e 在不同 shell 下的歧义
+    # 5. 更新版本记录
     local version_line="$(date +'%Y-%m-%d/%H:%M:%S')\t$url\t$new_hash"
     printf "%b\n" "$version_line" | $SUDO_CMD tee -a "$vfile" > /dev/null
 
+    # 6. 执行初始化 (-init) 并捕获状态
     if grep -q "\-init" "$DEST_DIR/$name"; then
-        "$DEST_DIR/$name" -init
+        if ! "$DEST_DIR/$name" -init; then
+            echo "❌ $name 初始化失败，请检查上方报错。"
+            return 1
+        fi
     fi
 
     echo "✅ $name 已完成更新与初始化。"
@@ -172,11 +173,12 @@ do_install() {
 
 # --- 主程序逻辑 ---
 
-# 自注册逻辑 (处理参数为 URL 的情况)
+# 自注册逻辑
 case "$1" in
     http*) do_install "$TOOL_NAME" "$1" ; exit 0 ;;
 esac
 
+# 帮助/文档逻辑
 if [ "$1" = "help" ] || [ "$1" = "-v" ] || [ "$1" = "--help" ]; then
     grep "^#" "$0" | head -n 15
     exit 0
@@ -186,6 +188,7 @@ if [ "$1" = "-doc" ]; then
     show_doc
 fi
 
+# 列表展示逻辑
 if [ -z "$1" ]; then
     echo "已安装工具列表 (位置: $META_DIR):"
     printf "%-15s %-20s %-10s %-s\n" "名称" "最后更新时间" "文档" "SHA256(前12位)"
@@ -206,9 +209,7 @@ fi
 
 if [ "$1" = "add" ]; then
     if [ -n "$2" ]; then
-        # 1. 解析出完整的 URL
         FINAL_URL=$(resolve_url "$2")
-        # 2. 从输入中提取文件名（如 linux-tools/ssh_tmux.sh -> ssh_tmux）
         NAME=$(basename "$2" .sh)
         do_install "$NAME" "$FINAL_URL"
     fi
