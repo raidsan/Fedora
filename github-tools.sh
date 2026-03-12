@@ -10,7 +10,7 @@
 # 5. 支持从网站下载进行自身注册安装:
 #       export TOOLS_URL=https://gh-proxy.com/raw.githubusercontent.com/raidsan/Fedora/refs/heads/main/github-tools.sh
 #       curl -sL $TOOLS_URL |  bash -s -- $TOOLS_URL
-# 依赖: curl, sha256sum, grep, awk
+# 依赖: curl, sha256sum, grep, awk, ps
 # 管理: /usr/local/share/github-tools-meta/
 # ==============================================================================
 
@@ -19,19 +19,22 @@ DEST_DIR="/usr/local/bin"
 DEST_PATH="$DEST_DIR/$TOOL_NAME"
 META_DIR="/usr/local/share/github-tools-meta"
 
-# 确保必要的系统目录存在
+# 确保必要的系统目录存在，用于存放可执行文件和版本元数据
 [ ! -d "$DEST_DIR" ] && mkdir -p "$DEST_DIR" 2>/dev/null
 [ ! -d "$META_DIR" ] && mkdir -p "$META_DIR" 2>/dev/null
 
-# 权限检测：根据当前 UID 判断是否需要通过 sudo 执行文件操作
+# 权限检测：判定当前执行者是否为 root，若非 root 则尝试定位 sudo 命令
 CURRENT_UID=$(id -u)
 SUDO_CMD=""
 if [ "$CURRENT_UID" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 && SUDO_CMD="sudo"
 fi
 
-# 获取下载 URL (关键逻辑：实现自注册)
-# 通过追溯进程树捕获 curl | bash 管道中的源链接，确保脚本知道自己是从哪下载的。
+# 获取下载 URL (实现自注册的核心逻辑)
+# 实现逻辑：
+# 1. 检查命令行参数 $1 是否为 URL。
+# 2. 若无参数，则向上追溯进程树（最多5层），读取父进程的 /proc/PID/cmdline。
+# 3. 利用正则从中提取以 .sh 结尾的 HTTP/HTTPS 链接，从而在管道执行时找回源地址。
 get_download_url() {
     case "$1" in
         http*) echo "$1"; return ;;
@@ -41,7 +44,6 @@ get_download_url() {
     for i in 1 2 3 4 5; do
         local ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
         [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
-        # 读取父进程的启动命令行，提取可能是脚本下载源的 URL
         local cmdlines=$(cat /proc/$ppid/cmdline 2>/dev/null | tr '\0' ' ')
         local url=$(echo "$cmdlines" | grep -oE 'https?://[^[:space:]"]+\.sh' | head -1)
         if [ -n "$url" ]; then
@@ -52,10 +54,9 @@ get_download_url() {
     done
 }
 
-# 提取基准 URL (用于支持相对路径添加工具)
-# 核心逻辑：
-# 从 github-tools 自身的版本记录中读取最后一次更新的完整 URL，
-# 剥离文件名后得到仓库的根目录地址，供“相对路径安装”使用。
+# 提取基准 URL (Base URL)
+# 实现逻辑：从 github-tools 自身的版本记录文件中提取最后一次安装的 URL，
+# 并剥离文件名部分，作为后续“添加相对路径脚本”时的基准根路径。
 get_base_url() {
     local vfile="$META_DIR/$TOOL_NAME.version"
     if [ -f "$vfile" ]; then
@@ -64,7 +65,10 @@ get_base_url() {
     fi
 }
 
-# 解析输入参数 (支持完整 URL 或 仓库内相对路径)
+# 解析输入参数 (URL 或 相对路径)
+# 实现逻辑：
+# 判断输入是否为完整 URL。若否，则调用 get_base_url 拼装成完整的 GitHub 下载链接，
+# 使得用户可以使用快捷命令如 `github-tools add sub/path.sh`。
 resolve_url() {
     local input=$1
     case "$input" in
@@ -75,21 +79,20 @@ resolve_url() {
                 echo "错误: 无法获取根路径，请先使用完整 URL 安装 $TOOL_NAME" >&2
                 exit 1
             fi
-            # 移除输入路径前部可能存在的斜杠，确保拼接正确
             echo "$base/${input#*/}"
             ;;
     esac
 }
 
-# 绕过服务器缓存的下载工具
+# 强制无缓存下载函数
 curl_no_cache() {
     local url="$1"
     local output="$2"
     curl -sL -H "Cache-Control: no-cache" "$url" -o "$output"
 }
 
-# 文档查阅逻辑 (核心显示功能)
-# 优先级：Glow (美化渲染) > Ghostwriter (编辑预览) > Cat (原始输出)
+# 文档查阅逻辑
+# 实现逻辑：支持调用渲染器（glow/ghostwriter）查看工具配套的 .md 文档，若无则回退至 cat。
 show_doc() {
     local doc_file="$META_DIR/$TOOL_NAME.md"
     if [ ! -f "$doc_file" ]; then
@@ -110,8 +113,8 @@ show_doc() {
     exit 0
 }
 
-# 核心安装/更新逻辑
-# 处理：下载 -> HASH 校验 -> 版本比对 -> 部署执行文件 -> 同步 .md 文档
+# 核心安装/更新逻辑单元
+# 实现逻辑：下载脚本 -> HASH 比对防止重复覆盖 -> 部署至 bin -> 同步 .md 说明文档 -> 记录元数据。
 do_install() {
     local name="$1"
     local url="$2"
@@ -119,38 +122,34 @@ do_install() {
     local vfile="$META_DIR/$name.version"
 
     if [ -z "$url" ]; then
-        echo "错误: 缺少有效的下载 URL。"
+        echo "错误: 未能捕获有效 URL。"
         return 1
     fi
 
-    echo "正在同步: $name 来自 $url ..."
+    echo "正在同步 $name: $url"
     
     if ! curl_no_cache "$url" "$tmp_file"; then
-        echo "错误: 无法从 URL 获取内容: $url"
+        echo "错误: 无法下载文件。"
         return 1
     fi
 
-    # 计算新下载文件的 SHA256，用于检测版本变动
     local new_hash=$(sha256sum "$tmp_file" | awk '{print $1}')
     local old_hash=""
     [ -f "$vfile" ] && old_hash=$(tail -n 1 "$vfile" | cut -f3)
 
-    # 如果 HASH 一致且目标文件已存在，则视为已是最新
     if [ "$new_hash" = "$old_hash" ] && [ -x "$DEST_DIR/$name" ]; then
-        echo "[$name] 已经是最新状态，无需更新。"
+        echo "[$name] 已经是最新版本。"
         rm -f "$tmp_file"
         return 0
     fi
 
-    # 部署文件并设置权限
     $SUDO_CMD cp "$tmp_file" "$DEST_DIR/$name"
     $SUDO_CMD chmod +x "$DEST_DIR/$name"
     
-    # 记录元数据 (格式: 时间 \t URL \t HASH)
     local m_time=$(date "+%Y-%m-%d %H:%M")
     echo -e "$m_time\t$url\t$new_hash" | $SUDO_CMD tee -a "$vfile" >/dev/null
     
-    # 同步说明文档：尝试下载同名的 .md 文件
+    # 同步配套文档
     local doc_url="${url%.sh}.md"
     curl_no_cache "$doc_url" "/tmp/$name.md"
     if [ -s "/tmp/$name.md" ]; then
@@ -161,17 +160,22 @@ do_install() {
     rm -f "$tmp_file" "/tmp/$name.md"
 }
 
-# --- 业务流程入口 ---
+# --- 业务逻辑入口 ---
 
-# 1. 处理自下载/自注册场景 (curl | bash)
-# 如果脚本直接在 bash 中运行且能溯源到 URL，则自动执行安装自身
+# 1. 确定自身运行路径，用于区分“管道执行”与“正式运行”
+# 在 bash 环境下获取脚本当前绝对路径
+ABS_SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+
+# 2. 处理自下载/自注册场景 (curl | bash)
+# 只要检测到有效 URL，且当前不是从正式安装路径运行，就启动安装逻辑
 DETECTED_URL=$(get_download_url "$1")
-if [[ "$0" == "bash" || "$0" == "sh" || "$0" == "-"* ]] && [ -n "$DETECTED_URL" ]; then
+if [ -n "$DETECTED_URL" ] && [ "$ABS_SELF" != "$DEST_PATH" ]; then
+    echo ">> 检测到脚本正通过管道或外部请求安装自身..."
     do_install "$TOOL_NAME" "$DETECTED_URL"
     exit 0
 fi
 
-# 2. 帮助与版本信息
+# 3. 基础帮助指令
 if [ "$1" = "help" ] || [ "$1" = "-v" ]; then
     grep "^# [0-9]." "$0"
     exit 0
@@ -181,9 +185,9 @@ if [ "$1" = "-doc" ]; then
     show_doc
 fi
 
-# 3. 列出当前管理的工具清单
+# 4. 列出工具清单 (无参数)
 if [ -z "$1" ]; then
-    printf "%-15s %-20s %-6s %-s\n" "工具名称" "最后更新时间" "文档" "SHA256(前10位)"
+    printf "%-15s %-20s %-6s %-s\n" "TOOL" "LAST_UPDATE" "DOC" "SHA256"
     if [ -d "$META_DIR" ]; then
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && break
@@ -198,7 +202,7 @@ if [ -z "$1" ]; then
     echo ""; exit 0
 fi
 
-# 4. 指令：add - 添加新工具
+# 5. 指令：add (添加新工具)
 if [ "$1" = "add" ]; then
     if [ -n "$2" ]; then
         FINAL_URL=$(resolve_url "$2")
@@ -210,15 +214,13 @@ if [ "$1" = "add" ]; then
     exit 0
 fi
 
-# 5. 指令：update - 检查并同步更新
+# 6. 指令：update (全局或特定更新)
 if [ "$1" = "update" ]; then
     if [ -n "$2" ]; then
-        # 更新指定工具
         VFILE="$META_DIR/$2.version"
         [ -f "$VFILE" ] && do_install "$2" "$(tail -n 1 "$VFILE" | cut -f2)"
     else
-        # 遍历更新所有工具，并将本管理工具置于最后更新
-        echo "正在检查所有工具更新..."
+        echo "开始全局同步更新..."
         for vfile in "$META_DIR"/*.version; do
             [ ! -e "$vfile" ] && continue
             T_NAME=$(basename "$vfile" .version)
@@ -226,8 +228,7 @@ if [ "$1" = "update" ]; then
             URL=$(tail -n 1 "$vfile" | cut -f2)
             do_install "$T_NAME" "$URL"
         done
-        
-        # 自身更新逻辑
+        # 自身最后更新以防运行中断
         VSELF="$META_DIR/$TOOL_NAME.version"
         [ -f "$VSELF" ] && do_install "$TOOL_NAME" "$(tail -n 1 "$VSELF" | cut -f2)"
     fi
