@@ -67,8 +67,8 @@ fi
 
 # --- 第二阶段: 运行时逻辑 ---
 run_tmux() {
-    # 仅在交互式终端且不在已有 tmux 会话中时执行
-    if [ -z "$TMUX" ] && [ -t 0 ]; then
+    # 不在已有 tmux 会话中时执行
+    if [ -z "$TMUX" ]; then
         local identifier=${1:-session}
         local session_name="ssh_$identifier"
         local hist_dir="$HOME/.tmux_history"
@@ -77,10 +77,12 @@ run_tmux() {
         [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
         echo "接入会话: $session_name (历史路径: $session_hist)"
 
-        # 启动会话并隔离历史文件
+        # 启动会话并隔离历史文件 (以登录shell方式启动, 否则不执行/etc/profile, tmux默认是非登录的交互shell, 它单独执行了登录shell用的  ~/.bash_profile)
         exec tmux new-session -A -s "$session_name" \
             -e "HISTFILE=$session_hist" \
-            "history -r $session_hist 2>/dev/null; exec ${SHELL:-/bin/sh}"
+            "history -r $session_hist 2>/dev/null; exec /bin/bash -l"
+    else
+        echo "tmux会话中, 不要重复运行"
     fi
 }
 
