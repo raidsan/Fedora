@@ -42,7 +42,7 @@ get_download_url() {
         [ -z "$ppid" ] || [ "$ppid" -eq 1 ] && break
         if [ -f "/proc/$ppid/cmdline" ]; then
             local cline=$(cat "/proc/$ppid/cmdline" 2>/dev/null | tr '\0' ' ')
-            local url=$(echo "$cline" | grep -oE 'https?://[^[:space:]"]+(\.sh|github|gh-proxy)[^[:space:]"]*' | head -1)
+            local url=$(echo "$cline" | grep -oE 'https?://[^[:space:]"]+(\.sh|github|gh-proxy)[^[:space:]]*' | head -1)
             [ -n "$url" ] && echo "$url" && return
         fi
         pid=$ppid
@@ -97,32 +97,42 @@ show_doc() {
 # 核心安装与更新单元
 # 实现逻辑：下载 -> 状态码判定 -> HASH 比对 -> 部署 -> 元数据记录 -> 文档同步。
 do_install() {
-    local name="$1"
+    local raw_name="$1"
     local url="$2"
-    local tmp_sh="/tmp/$name.sh"
-    local vfile="$META_DIR/$name.version"
+    # 修复逻辑：提取纯文件名作为本地存储索引，防止带有斜杠的路径名导致文件系统写入失败
+    local safe_name=$(basename "$raw_name")
+    local tmp_sh="/tmp/${safe_name}.sh"
+    local vfile="$META_DIR/${safe_name}.version"
 
-    echo ">> 正在同步: $name"
+    echo ">> 正在同步: $raw_name"
 
-    # 使用 curl 获取 HTTP 响应码，精准处理 404 等异常情况
+    # 使用 curl 获取 HTTP 响应码，并捕获 stderr 以诊断网络故障
+    local curl_err_file="/tmp/github_tools_curl.err"
     local http_code=$(curl -L -k -s -H "Cache-Control: no-cache" --connect-timeout 15 \
-        "$url" -o "$tmp_sh" -w "%{http_code}")
+        "$url" -o "$tmp_sh" -w "%{http_code}" 2>"$curl_err_file")
     local exit_status=$?
 
     if [ "$exit_status" -ne 0 ]; then
         echo "   [错误] 网络请求故障 (curl 退出码: $exit_status)。"
+        [ -f "$curl_err_file" ] && echo "   [诊断] $(cat "$curl_err_file")"
+        rm -f "$curl_err_file"
         return 1
     fi
 
     case "$http_code" in
         200) ;;
-        404) echo "   [错误] 远程文件不存在 (404): $url"; rm -f "$tmp_sh"; return 1 ;;
-        *)   echo "   [错误] 服务器响应状态码: $http_code"; rm -f "$tmp_sh"; return 1 ;;
+        404) echo "   [错误] 远程文件不存在 (404): $url"; rm -f "$tmp_sh" "$curl_err_file"; return 1 ;;
+        *)   echo "   [错误] 服务器响应状态码: $http_code"; rm -f "$tmp_sh" "$curl_err_file"; return 1 ;;
     esac
 
-    if [ ! -s "$tmp_sh" ]; then
-        echo "   [错误] 下载内容为空。"
-        rm -f "$tmp_sh"
+    # 校验本地文件是否存在及是否为空
+    if [ ! -f "$tmp_sh" ]; then
+        echo "   [错误] 本地 I/O 错误：文件未能成功创建于 /tmp。"
+        rm -f "$curl_err_file"
+        return 1
+    elif [ ! -s "$tmp_sh" ]; then
+        echo "   [错误] 下载失败：远程返回内容为空。"
+        rm -f "$tmp_sh" "$curl_err_file"
         return 1
     fi
 
@@ -130,24 +140,24 @@ do_install() {
     local old_hash=""
     [ -f "$vfile" ] && old_hash=$(tail -n 1 "$vfile" | cut -f3)
 
-    if [ "$new_hash" = "$old_hash" ] && [ -x "$DEST_DIR/$name" ]; then
+    if [ "$new_hash" = "$old_hash" ] && [ -x "$DEST_DIR/$safe_name" ]; then
         echo "   [信息] HASH 无变化，无需更新。"
-        rm -f "$tmp_sh"
+        rm -f "$tmp_sh" "$curl_err_file"
         return 0
     fi
 
     # 部署文件并设置执行权限
-    $SUDO_CMD cp "$tmp_sh" "$DEST_DIR/$name" && $SUDO_CMD chmod +x "$DEST_DIR/$name"
+    $SUDO_CMD cp "$tmp_sh" "$DEST_DIR/$safe_name" && $SUDO_CMD chmod +x "$DEST_DIR/$safe_name"
     
     local m_time=$(date "+%Y-%m-%d %H:%M")
     echo -e "$m_time\t$url\t$new_hash" | $SUDO_CMD tee -a "$vfile" >/dev/null
     
     # 自动尝试同步配套文档 (.md)
     local doc_url="${url%.sh}.md"
-    curl -sfL "$doc_url" -o "/tmp/$name.md" && [ -s "/tmp/$name.md" ] && $SUDO_CMD cp "/tmp/$name.md" "$META_DIR/$name.md"
+    curl -sfL "$doc_url" -o "/tmp/${safe_name}.md" && [ -s "/tmp/${safe_name}.md" ] && $SUDO_CMD cp "/tmp/${safe_name}.md" "$META_DIR/${safe_name}.md"
 
-    echo "   [成功] $name 同步部署完成。"
-    rm -f "$tmp_sh" "/tmp/$name.md"
+    echo "   [成功] $safe_name 同步部署完成。"
+    rm -f "$tmp_sh" "/tmp/${safe_name}.md" "$curl_err_file"
 }
 
 # --- 程序执行逻辑 ---
@@ -181,9 +191,10 @@ case "$1" in
     update)
         if [ -n "$2" ]; then
             # 针对特定工具的更新逻辑：
-            # 1. 优先从本地 meta 提取历史 URL；
+            # 1. 优先从本地 meta 提取历史 URL（使用 basename 确保索引准确）；
             # 2. 若无 meta 记录，则按 github-tools 本身位置尝试合成 URL。
-            VF="$META_DIR/$2.version"
+            N_IDX=$(basename "$2")
+            VF="$META_DIR/$N_IDX.version"
             if [ -f "$VF" ]; then
                 TARGET_URL=$(tail -n 1 "$VF" | cut -f2)
             else
