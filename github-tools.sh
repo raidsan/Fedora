@@ -123,17 +123,22 @@ do_install() {
         "$url" -o "$tmp_sh" -w "%{http_code}" 2>"$curl_err_file")
     local exit_status=$?
 
-    # 诊断逻辑：处理 000 或 curl 非零退出码情况（如连接被重置或超时）
-    if [ "$exit_status" -ne 0 ] || [ "$http_code" = "000" ]; then
-        echo "   [错误] 网络请求失败。可能由于 DNS 污染或连接被重置。"
+    # 1. 优先处理网络连接层面的错误 (状态码 000)
+    if [ "$http_code" = "000" ] || [ "$exit_status" -ne 0 ]; then
+        echo "   [错误] 网站无法访问 (网络连接中断/超时)。"
         echo "   [状态] Exit Code: $exit_status / HTTP Code: $http_code"
         [ -s "$curl_err_file" ] && echo "   [诊断] $(cat "$curl_err_file")"
         rm -f "$tmp_sh" "$curl_err_file"
         return 1
     fi
 
+    # 2. 处理应用层错误 (文件不存在等)
     if [ "$http_code" -ne 200 ]; then
+        if [ "$http_code" = "404" ]; then
+            echo "   [错误] 远程文件不存在 (404): $url"
+        else
         echo "   [错误] 服务器响应异常 (HTTP: $http_code): $url"
+        fi
         rm -f "$tmp_sh" "$curl_err_file"
         return 1
     fi
