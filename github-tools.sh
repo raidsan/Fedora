@@ -108,7 +108,7 @@ show_doc() {
 do_install() {
     local raw_name="$1"
     local url="$2"
-    # 工具名：提取纯文件名，剥离.sh 后缀作为本地存储标识
+    # 工具名：提取纯文件名，剥离 .sh 后缀作为本地存储标识
     local safe_name=$(basename "$raw_name" .sh)
     local tmp_sh="/tmp/${safe_name}.sh"
     local vfile="$META_DIR/${safe_name}.version"
@@ -116,20 +116,24 @@ do_install() {
     echo ">> 正在同步: $raw_name"
 
     # 使用 curl 获取 HTTP 响应码，并捕获 stderr 以诊断网络故障
+    # 增加 --max-time 防止网络僵死导致脚本挂起
     local curl_err_file="/tmp/github_tools_curl.err"
-    local http_code=$(curl -L -k -s -H "Cache-Control: no-cache" --connect-timeout 15 \
+    local http_code=$(curl -L -k -s -H "Cache-Control: no-cache" \
+        --connect-timeout 10 --max-time 30 \
         "$url" -o "$tmp_sh" -w "%{http_code}" 2>"$curl_err_file")
     local exit_status=$?
 
-    if [ "$exit_status" -ne 0 ]; then
-        echo "   [错误] 网络请求故障 (curl 退出码: $exit_status)。"
-        [ -f "$curl_err_file" ] && echo "   [诊断] $(cat "$curl_err_file")"
-        rm -f "$curl_err_file"
+    # 诊断逻辑：处理 000 或 curl 非零退出码情况（如连接被重置或超时）
+    if [ "$exit_status" -ne 0 ] || [ "$http_code" = "000" ]; then
+        echo "   [错误] 网络请求失败。可能由于 DNS 污染或连接被重置。"
+        echo "   [状态] Exit Code: $exit_status / HTTP Code: $http_code"
+        [ -s "$curl_err_file" ] && echo "   [诊断] $(cat "$curl_err_file")"
+        rm -f "$tmp_sh" "$curl_err_file"
         return 1
     fi
 
     if [ "$http_code" -ne 200 ]; then
-        echo "   [错误] 远程文件不存在 (HTTP: $http_code): $url"
+        echo "   [错误] 服务器响应异常 (HTTP: $http_code): $url"
         rm -f "$tmp_sh" "$curl_err_file"
         return 1
     fi
@@ -201,7 +205,7 @@ case "$1" in
         ;;
     update)
         if [ -n "$2" ]; then
-            # 识别本地已安装工具：剥离可能输入的 .sh 后缀
+            # 识别本地已安装工具：剥离路径和可能输入的 .sh 后缀
             N_IDX=$(basename "$2" .sh)
             VF="$META_DIR/$N_IDX.version"
             if [ -f "$VF" ]; then
