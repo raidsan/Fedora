@@ -70,18 +70,27 @@ get_base_url() {
 
 # 解析输入参数 (URL 或 相对路径)
 # 实现逻辑：根据工具名或路径合成完整的下载 URL。
+# 增加后缀自适应逻辑：支持自动补全 .sh 但避免重复叠加。
 resolve_url() {
     local input=$1
+    local full_url=""
+    
     if [[ "$input" == http* ]]; then
-        echo "$input"
+        full_url="$input"
     else
         local base=$(get_base_url)
         if [ -z "$base" ]; then
             echo "错误: 无法确定仓库基准路径。" >&2
             exit 1
         fi
-        echo "$base/${input#/}"
+        # 如果输入不带 .sh 且非目录形式，尝试补全后缀
+        if [[ "$input" != *.sh ]]; then
+            full_url="$base/${input#/}.sh"
+        else
+            full_url="$base/${input#/}"
+        fi
     fi
+    echo "$full_url"
 }
 
 # 文档查阅逻辑
@@ -99,8 +108,8 @@ show_doc() {
 do_install() {
     local raw_name="$1"
     local url="$2"
-    # 修复逻辑：提取纯文件名作为本地存储索引，防止带有斜杠的路径名导致文件系统写入失败
-    local safe_name=$(basename "$raw_name")
+    # 工具名：提取纯文件名，剥离.sh 后缀作为本地存储标识
+    local safe_name=$(basename "$raw_name" .sh)
     local tmp_sh="/tmp/${safe_name}.sh"
     local vfile="$META_DIR/${safe_name}.version"
 
@@ -119,11 +128,11 @@ do_install() {
         return 1
     fi
 
-    case "$http_code" in
-        200) ;;
-        404) echo "   [错误] 远程文件不存在 (404): $url"; rm -f "$tmp_sh" "$curl_err_file"; return 1 ;;
-        *)   echo "   [错误] 服务器响应状态码: $http_code"; rm -f "$tmp_sh" "$curl_err_file"; return 1 ;;
-    esac
+    if [ "$http_code" -ne 200 ]; then
+        echo "   [错误] 远程文件不存在 (HTTP: $http_code): $url"
+        rm -f "$tmp_sh" "$curl_err_file"
+        return 1
+    fi
 
     # 校验本地文件是否存在及是否为空
     if [ ! -f "$tmp_sh" ]; then
@@ -150,6 +159,7 @@ do_install() {
     $SUDO_CMD cp "$tmp_sh" "$DEST_DIR/$safe_name" && $SUDO_CMD chmod +x "$DEST_DIR/$safe_name"
     
     local m_time=$(date "+%Y-%m-%d %H:%M")
+    # 记录元数据：时间 \t URL \t HASH
     echo -e "$m_time\t$url\t$new_hash" | $SUDO_CMD tee -a "$vfile" >/dev/null
     
     # 自动尝试同步配套文档 (.md)
@@ -184,23 +194,24 @@ case "$1" in
         ;;
     add)     
         [ -z "$2" ] && echo "用法: add <URL/相对路径>" && exit 1
+        # 提取基名并移除 .sh 后缀进行安装
         do_install "$(basename "$2" .sh)" "$(resolve_url "$2")"
         echo "" # 视觉分隔
         exit 0 
         ;;
     update)
         if [ -n "$2" ]; then
-            # 针对特定工具的更新逻辑：
-            # 1. 优先从本地 meta 提取历史 URL（使用 basename 确保索引准确）；
-            # 2. 若无 meta 记录，则按 github-tools 本身位置尝试合成 URL。
-            N_IDX=$(basename "$2")
+            # 识别本地已安装工具：剥离可能输入的 .sh 后缀
+            N_IDX=$(basename "$2" .sh)
             VF="$META_DIR/$N_IDX.version"
             if [ -f "$VF" ]; then
+                # 针对特定工具的更新逻辑：优先核对本地版本记录中的原始安装链接
                 TARGET_URL=$(tail -n 1 "$VF" | cut -f2)
             else
-                TARGET_URL=$(resolve_url "$2.sh")
+                # 若无记录，尝试按当前输入合成 URL
+                TARGET_URL=$(resolve_url "$2")
             fi
-            do_install "$2" "$TARGET_URL"
+            do_install "$N_IDX" "$TARGET_URL"
         else
             echo "正在启动全局同步..."
             for vfile in "$META_DIR"/*.version; do
