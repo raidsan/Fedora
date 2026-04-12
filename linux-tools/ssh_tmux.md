@@ -10,14 +10,14 @@
 - **多会话管理**：支持开启多个独立的持久化终端。
 - **历史记录隔离**：每个具名会话拥有独立的 Bash 命令历史文件，互不干扰。
 - **自动加载**：连入会话时，自动加载该会话专属的历史缓存。
-- **脚本更新**：支持通过 `github-tools`升级管理。
+- **环境预设**：支持启动时自动进入指定目录或执行预设命令。
 
 ---
 
 ## 2. 历史记录机制
 - **存储路径**：`~/.tmux_history/ssh_[会话标识]`
 - **工作原理**: 进入会话时，脚本通过 `HISTFILE` 环境变量隔离历史，并强制 Shell 在启动时执行 `history -r` 加载对应文件。
-- **实时同步**：安装时会自动向 `~/.bashrc` (Bash) 或 `~/.profile` (Ash)`PROMPT_COMMAND="history -a; $PROMPT_COMMAND"` 实现命令历史实时保存，其他shell可能不支持。
+- **实时同步**：安装时会自动配置 `/etc/profile.d/ssh_tmux.sh`，实现命令历史实时保存。
 
 ---
 
@@ -36,11 +36,21 @@ ssh_tmux [会话标识]
 ```Bash
 ssh user@remote_host -t "ssh_tmux [会话标识]"
 ```
-* 示例：ssh lgw@amd395 -t "ssh_tmux backup"
 * 注意：-t 参数是必须的，用于强制分配伪终端。
 
-### 场景 C：登录自动触发
-将以下行添加到服务器的 ~/.bashrc 末尾，实现全自动保护：
+### 场景 C：指定初始路径或附加命令
+脚本支持第二个参数。如果参数是目录，则进入 Bash 后自动 cd；如果是命令，则在交互界面准备就绪后执行：
+
+```Bash
+# 进入 dev 会话并自动跳转到项目目录
+ssh_tmux dev /var/www/html
+
+# 进入 monitor 会话并自动执行日志监控
+ssh_tmux monitor "tail -f /var/log/nginx/access.log"
+```
+
+### 场景 D：登录自动触发
+将以下行添加到服务器的 ~/.bashrc 末尾：
 ```Bash
 # 仅在交互式终端且是 SSH 登录时启动
 [ -t 0 ] && [ -n "$SSH_CONNECTION" ] && ssh_tmux

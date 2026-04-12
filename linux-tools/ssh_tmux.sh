@@ -2,7 +2,8 @@
 
 # ==============================================================================
 # 名称: ssh_tmux
-# 用途: SSH 登录时自动启动/附加 tmux 会话，实现每个会话独立的命令历史缓存
+# 用途: SSH 登录时自动启动/附加 tmux 会话，实现每个会话独立的命令历史缓存。
+#       支持第二个参数指定初始路径或启动命令，并在进入交互环境后执行。
 # 管理: 建议通过 github-tools 安装/更新
 # ==============================================================================
 
@@ -70,6 +71,7 @@ run_tmux() {
     # 不在已有 tmux 会话中时执行
     if [ -z "$TMUX" ]; then
         local identifier=${1:-session}
+        local extra_param=$2
         local session_name="ssh_$identifier"
         local hist_dir="$HOME/.tmux_history"
         local session_hist="$hist_dir/ssh_$identifier"
@@ -77,13 +79,28 @@ run_tmux() {
         [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
         echo "接入会话: $session_name (历史路径: $session_hist)"
 
-        # 启动会话并隔离历史文件 (以登录shell方式启动, 否则不执行/etc/profile, tmux默认是非登录的交互shell, 它单独执行了登录shell用的  ~/.bash_profile)
+        # 构造 Bash 启动脚本：
+        # 1. 首先加载全局环境和个人环境
+        # 2. 加载该会话专属的历史记录
+        # 3. 处理路径跳转或附加命令
+        local init_cmd="[ -f /etc/profile ] && . /etc/profile; [ -f ~/.bashrc ] && . ~/.bashrc; "
+        init_cmd="${init_cmd} history -r $session_hist 2>/dev/null; "
+
+        if [ -n "$extra_param" ]; then
+            if [ -d "$extra_param" ]; then
+                init_cmd="${init_cmd} cd \"$extra_param\"; "
+            else
+                init_cmd="${init_cmd} $extra_param; "
+            fi
+        fi
+
+        # 使用 bash --rcfile 启动，确保上述命令在交互界面准备就绪后生效
         exec tmux new-session -A -s "$session_name" \
             -e "HISTFILE=$session_hist" \
-            "history -r $session_hist 2>/dev/null; exec /bin/bash -l"
+            "/bin/bash --rcfile <(echo '$init_cmd')"
     else
         echo "tmux会话中, 不要重复运行"
     fi
 }
 
-run_tmux "$1"
+run_tmux "$@"
